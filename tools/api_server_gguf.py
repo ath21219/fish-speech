@@ -4,7 +4,7 @@ Triton-accelerated Q6_K inference with OpenAI-compatible TTS endpoint.
 
 Usage:
   python tools/api_server_gguf.py \
-    --gguf-path ./models/gguf/s2-pro-q6_k.gguf \
+    --model-name s2-pro-q6_k \
     --listen 0.0.0.0:7820
 """
 
@@ -38,9 +38,18 @@ sys.path.insert(0, str(project_root))
 @contextmanager
 def codec_on_gpu():
     """
-    Offload GGUF model to CPU, move codec to GPU,
-    then restore after encode/decode.
+    Provide codec on GPU for encode/decode operations.
+
+    When codec_gpu_resident is enabled (default for Q3_K and other small models),
+    codec stays on GPU permanently alongside the model — no swap needed.
+    Falls back to model↔codec swap when VRAM is too tight.
     """
+    if state.codec_gpu_resident:
+        # Codec already on GPU, just yield it
+        yield state.codec
+        return
+
+    # Legacy swap path for large models that don't fit with codec
     model = state.model
     codec = state.codec
     device = state.device
@@ -61,10 +70,10 @@ def codec_on_gpu():
     vram_after = torch.cuda.memory_allocated() / 1e9
     logger.info(f"Model offloaded in {time.perf_counter() - t0:.1f}s (VRAM: {vram_after:.2f} GB)")
 
-    # 2. Move codec to GPU (already FP16, no dtype conversion needed)
+    # 2. Move codec to GPU
     logger.info("Moving codec to GPU...")
     t0 = time.perf_counter()
-    codec.to(device=device)  # ← FP32変換不要
+    codec.to(device=device)
     torch.cuda.synchronize()
     vram = torch.cuda.memory_allocated() / 1e9
     logger.info(f"Codec on GPU in {time.perf_counter() - t0:.1f}s (VRAM: {vram:.2f} GB)")
@@ -77,12 +86,16 @@ def codec_on_gpu():
 
 def restore_after_codec():
     """Move codec back to CPU and restore GGUF model to GPU."""
+    if state.codec_gpu_resident:
+        # Nothing to restore — both model and codec stay on GPU
+        return
+
     model = state.model
     codec = state.codec
     device = state.device
 
     logger.info("Offloading codec to CPU...")
-    codec.to(device="cpu")  # ← FP16のまま（FP32戻し不要）
+    codec.to(device="cpu")
     torch.cuda.empty_cache()
 
     logger.info("Restoring GGUF model to GPU...")
@@ -163,24 +176,47 @@ class GGUFServerState:
         self.lock = Lock()
         self.max_seq_len = 2048
         self.ready = False
+        self.active_model_name = None
+        self.codec_gpu_resident = False  # True when codec stays on GPU permanently
 
 state = GGUFServerState()
 app = FastAPI(title="Fish Speech GGUF API", version="1.0.0")
+MODELS_DIR = Path("models")
 
 
 # ============================================================
 # Startup (from working code, unchanged)
 # ============================================================
 
-def load_models(args):
-    """Load GGUF model and codec at startup."""
+def load_models(args, name=None):
+    """Load GGUF model and codec dynamically."""
     from fish_speech.gguf import load_gguf_model
     from fish_speech.gguf.dequant import dequantize_tensor
 
-    logger.info("Loading GGUF model...")
+    if not name:
+        logger.info("No model specified to load at startup.")
+        return
+
+    gguf_path = MODELS_DIR / name / "model.gguf"
+    if not gguf_path.exists():
+        raise FileNotFoundError(f"Model file not found for {name}")
+
+    # Unload existing
+    if state.model is not None:
+        logger.info("Unloading current model...")
+        del state.model
+        del state.codec
+        state.model = None
+        state.codec = None
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    logger.info(f"Loading GGUF model from {gguf_path}...")
     t0 = time.perf_counter()
     model = load_gguf_model(
-        gguf_path=args.gguf_path,
+        gguf_path=str(gguf_path),
         device=args.device,
         compute_dtype=torch.float16,
         max_seq_len=args.max_seq_len,
@@ -233,7 +269,48 @@ def load_models(args):
     state.sample_rate = codec.sample_rate
     state.device = args.device
     state.max_seq_len = args.max_seq_len
+    state.active_model_name = name
     state.ready = True
+
+    # Try to keep codec on GPU alongside model (avoids costly CPU↔GPU swap)
+    if torch.cuda.is_available() and args.device == "cuda":
+        model_vram = torch.cuda.memory_allocated() / 1e9
+        total_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+        # Estimate codec GPU size: params→FP16 (2B), buffers keep dtype (bool=1B, float=2-4B)
+        n_params = sum(p.numel() for p in codec.parameters())
+        param_size_f16 = n_params * 2  # params will be cast to FP16
+        buffer_size_gpu = sum(b.numel() * b.element_size() for b in codec.buffers())  # buffers keep dtype
+        codec_size_gpu = (param_size_f16 + buffer_size_gpu) / 1e9
+        codec_size_current = (sum(p.numel() * p.element_size() for p in codec.parameters())
+                              + buffer_size_gpu) / 1e9
+        n_buffers = sum(b.numel() for b in codec.buffers())
+        logger.info(f"Codec size: {n_params/1e6:.1f}M params + {n_buffers/1e6:.1f}M buffers, "
+                    f"current={codec_size_current:.2f} GB, GPU(F16)≈{codec_size_gpu:.2f} GB")
+        headroom = 1.0  # 1 GB headroom for KV cache, activations, etc.
+
+        if model_vram + codec_size_gpu + headroom < total_vram:
+            logger.info(f"Moving codec to GPU (model={model_vram:.2f} GB + "
+                        f"codec≈{codec_size_gpu:.2f} GB, total VRAM={total_vram:.1f} GB)")
+            t0 = time.perf_counter()
+            codec = codec.to(device="cuda", dtype=torch.float16)
+            codec.eval()
+            state.codec = codec
+            state.codec_gpu_resident = True
+            vram_now = torch.cuda.memory_allocated() / 1e9
+            logger.info(f"Codec on GPU in {time.perf_counter() - t0:.1f}s "
+                        f"(VRAM: {vram_now:.2f} GB)")
+        else:
+            logger.info(f"Codec stays on CPU (model={model_vram:.2f} GB + "
+                        f"codec≈{codec_size_gpu:.2f} GB would exceed "
+                        f"{total_vram:.1f} GB VRAM)")
+            state.codec_gpu_resident = False
+
+    # Pre-compile Triton kernels to avoid JIT latency on first inference
+    from fish_speech.gguf.dequant import warmup_triton_kernels
+    logger.info("Warming up Triton kernels...")
+    t0 = time.perf_counter()
+    warmup_triton_kernels(model, dtype=torch.float16)
+    logger.info(f"Triton warmup done in {time.perf_counter() - t0:.1f}s")
 
     if torch.cuda.is_available():
         vram = torch.cuda.memory_allocated() / 1e9
@@ -252,7 +329,6 @@ def _load_codec_from_gguf(model, device="cpu"):
     from fish_speech.gguf.dequant import dequantize_tensor, NATIVE_TORCH_QTYPES, DEQUANT_FN
     from hydra.utils import instantiate
     from omegaconf import OmegaConf
-    from torch.nn.utils import remove_weight_norm
 
     codec_tensors = getattr(model, '_gguf_codec_tensors', None)
     if not codec_tensors:
@@ -301,12 +377,29 @@ def _load_codec_from_gguf(model, device="cpu"):
     codec = instantiate(cfg)
     codec.eval()
 
-    # 2. Remove weight_norm before loading (avoids weight_g/weight_v issues)
-    for module in codec.modules():
-        try:
-            remove_weight_norm(module)
-        except ValueError:
-            pass
+    # 2. Remove all weight_norm parametrizations so state_dict keys become plain "weight"
+    #    The codec uses TWO weight_norm APIs:
+    #    - New API (torch.nn.utils.parametrizations.weight_norm) -> parametrizations.weight.original0/1
+    #    - Old API (torch.nn.utils.weight_norm) -> weight_g/weight_v
+    #    GGUF stores combined "weight" tensors, so we remove weight_norm to match.
+    from torch.nn.utils.parametrize import remove_parametrizations
+    wn_removed = 0
+    for name, module in codec.named_modules():
+        # New parametrizations API: check for parametrizations attribute
+        if hasattr(module, 'parametrizations') and hasattr(module.parametrizations, 'weight'):
+            try:
+                remove_parametrizations(module, 'weight')
+                wn_removed += 1
+            except Exception as e:
+                logger.warning(f"Failed to remove parametrization from {name}: {e}")
+        # Old weight_norm API: check for weight_g/weight_v attributes
+        elif hasattr(module, 'weight_g') and hasattr(module, 'weight_v'):
+            try:
+                torch.nn.utils.remove_weight_norm(module)
+                wn_removed += 1
+            except Exception as e:
+                logger.warning(f"Failed to remove weight_norm from {name}: {e}")
+    logger.info(f"Removed weight_norm from {wn_removed} modules")
 
     # 3. Build state dict from GGUF codec tensors
     gguf_state_dict = {}
@@ -317,9 +410,6 @@ def _load_codec_from_gguf(model, device="cpu"):
         else:
             param_name = gguf_name
 
-        # Convert GGUF shape (reversed for 2D+) back to tensor
-        # Note: _gguf_tensor_to_raw in loader.py already reversed the shape,
-        # so 'gguf_shape' here is already in PyTorch convention
         if qtype in NATIVE_TORCH_QTYPES:
             if qtype == gguf_lib.GGMLQuantizationType.F16:
                 tensor = raw_data.view(torch.float16).reshape(gguf_shape)
@@ -335,29 +425,28 @@ def _load_codec_from_gguf(model, device="cpu"):
 
         gguf_state_dict[param_name] = tensor.to(device)
 
-    # 4. Load into codec model
-    # The GGUF exporter may have used slightly different naming than
-    # what Hydra creates. We need to handle potential mismatches.
+    # 4. Load into codec model (weight_norm removed, so keys should match directly)
     codec_state = codec.state_dict()
     loaded = 0
     skipped = []
 
     for param_name, param_tensor in gguf_state_dict.items():
         if param_name in codec_state:
-            if codec_state[param_name].shape == param_tensor.shape:
+            target_shape = codec_state[param_name].shape
+            if target_shape == param_tensor.shape:
                 codec_state[param_name] = param_tensor
                 loaded += 1
+            elif param_tensor.numel() == codec_state[param_name].numel():
+                codec_state[param_name] = param_tensor.reshape(target_shape)
+                loaded += 1
+            elif target_shape == param_tensor.T.shape and param_tensor.dim() == 2:
+                codec_state[param_name] = param_tensor.T
+                loaded += 1
             else:
-                # Shape mismatch — might be transposed (GGUF convention)
-                if (codec_state[param_name].shape == param_tensor.T.shape
-                        and param_tensor.dim() == 2):
-                    codec_state[param_name] = param_tensor.T
-                    loaded += 1
-                else:
-                    skipped.append(
-                        f"{param_name}: GGUF {param_tensor.shape} vs "
-                        f"model {codec_state[param_name].shape}"
-                    )
+                skipped.append(
+                    f"{param_name}: GGUF {param_tensor.shape} ({param_tensor.numel()}) vs "
+                    f"model {target_shape} ({codec_state[param_name].numel()})"
+                )
         else:
             skipped.append(f"{param_name}: not in model state_dict")
 
@@ -367,12 +456,37 @@ def _load_codec_from_gguf(model, device="cpu"):
         f"Codec: loaded {loaded}/{len(gguf_state_dict)} tensors from GGUF, "
         f"{len(skipped)} skipped"
     )
-    if skipped and len(skipped) <= 20:
-        for s in skipped:
-            logger.debug(f"  Codec skip: {s}")
+    if skipped:
+        for s in skipped[:30]:
+            logger.warning(f"  Codec skip: {s}")
+        if len(skipped) > 30:
+            logger.warning(f"  ... and {len(skipped) - 30} more")
 
-    # 5. Move to target device/dtype
-    codec = codec.to(device=device, dtype=torch.float16)
+    # 5. Shrink oversized Transformer buffers (causal_mask, freqs_cis)
+    # The Transformer class hardcodes 32768×32768 causal masks (~1 GB each × 3 instances).
+    # For codec inference we only need a few hundred frames max.
+    max_codec_frames = 2048  # ~24s at 44100Hz/512hop, more than enough
+    shrunk_buffers = 0
+    for name, module in codec.named_modules():
+        if hasattr(module, 'causal_mask') and module.causal_mask is not None:
+            old_size = module.causal_mask.shape[0]
+            if old_size > max_codec_frames:
+                new_mask = module.causal_mask[:max_codec_frames, :max_codec_frames].clone()
+                module.register_buffer("causal_mask", new_mask, persistent=False)
+                shrunk_buffers += 1
+        if hasattr(module, 'freqs_cis') and module.freqs_cis is not None:
+            if module.freqs_cis.shape[0] > max_codec_frames:
+                new_freqs = module.freqs_cis[:max_codec_frames].clone()
+                module.register_buffer("freqs_cis", new_freqs, persistent=False)
+                shrunk_buffers += 1
+    if shrunk_buffers > 0:
+        logger.info(f"Shrunk {shrunk_buffers} Transformer buffers to max_frames={max_codec_frames}")
+
+    # 6. Move to target device/dtype
+    # CPU: float32 (CPUs lack efficient float16 compute)
+    # GPU: float16 (saves VRAM, GPU has native FP16 support)
+    target_dtype = torch.float32 if device == "cpu" else torch.float16
+    codec = codec.to(device=device, dtype=target_dtype)
 
     # Verify essential attributes
     if not hasattr(codec, 'sample_rate'):
@@ -577,10 +691,16 @@ def generate_speech(req: TTSRequest) -> np.ndarray:
             logger.warning(f"Batch {batch_idx}: no codes generated, skipping")
             continue
 
-        # Decode on CPU
+        # Decode audio from VQ codes
         with torch.inference_mode():
-            logger.info(f"Decoding: codes shape={codes.shape}, codec device={next(state.codec.parameters()).device}, codec dtype={next(state.codec.parameters()).dtype}")
-            audio_segment = decode_to_audio(codes.cpu(), state.codec)
+            codec_dev = next(state.codec.parameters()).device
+            logger.info(f"Decoding: codes shape={codes.shape}, "
+                        f"codec device={codec_dev}, "
+                        f"codec dtype={next(state.codec.parameters()).dtype}")
+            t_dec = time.perf_counter()
+            codes_for_decode = codes.to(codec_dev)
+            audio_segment = decode_to_audio(codes_for_decode, state.codec)
+            logger.info(f"Codec decode in {time.perf_counter() - t_dec:.2f}s")
         all_segments.append(audio_segment.float().cpu().numpy())
 
         # Add back to conversation for multi-batch context
@@ -615,8 +735,8 @@ async def health():
     if torch.cuda.is_available():
         vram = torch.cuda.memory_allocated() / 1e9
     return HealthResponse(
-        status="ok" if state.ready else "loading",
-        model="s2-pro-q6_k-gguf",
+        status="ok" if state.ready else "loading" if state.active_model_name else "empty",
+        model=state.active_model_name or "",
         device=state.device,
         vram_used_gb=round(vram, 2),
     )
@@ -862,20 +982,150 @@ async def tts(req: TTSRequest):
     )
 
 
+
+
+@app.post("/v1/models")
+async def create_model(
+    name: str = Form(...),
+    config: str = Form(""),
+    tokenizer: str = Form(""),
+    model: UploadFile = File(...),
+):
+    """Register a reference model."""
+    # Validate name
+    if not name or not name.strip():
+        raise HTTPException(400, "Model name cannot be empty")
+    name = name.strip()
+    if not all(c.isalnum() or c in "-_ " for c in name):
+        raise HTTPException(400, "Model name can only contain alphanumeric, hyphen, underscore, space")
+
+    model_dir = MODELS_DIR / name
+    if model_dir.exists():
+        raise HTTPException(409, f"Model '{name}' already exists")
+
+    # Read and validate model
+    model_bytes = await model.read()
+    if len(model_bytes) < 1000:
+        raise HTTPException(400, "Model file too small or empty")
+
+    # Determine extension from filename
+    ext = Path(model.filename).suffix.lower() if model.filename else ".safetensors"
+    if ext not in (".safetensors", ".gguf"):
+        ext = ".safetensors"
+
+    # Save
+    model_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        model_path = model_dir / f"model{ext}"
+        model_path.write_bytes(model_bytes)
+
+        (model_dir / "config.json").write_text(config)
+        (model_dir / "tokenizer.json").write_text(tokenizer)
+
+        logger.info(f"Model '{name}' registered: {model_path} ({len(model_bytes)} bytes)")
+
+        return JSONResponse(
+            status_code=201,
+            content={
+                "name": name,
+                "model_file": str(model_path.name),
+                "model_size": len(model_bytes),
+                "message": f"Model '{name}' created successfully",
+            },
+        )
+
+    except Exception as e:
+        # Cleanup on failure
+        if model_dir.exists():
+            shutil.rmtree(model_dir)
+        raise HTTPException(500, f"Failed to save model: {e}")
+
 @app.get("/v1/models")
 async def list_models():
-    return {
-        "data": [{
-            "id": "fish-speech-s2-pro-gguf",
+    models = []
+    if MODELS_DIR.exists():
+        for d in sorted(MODELS_DIR.iterdir()):
+            if d.is_dir():
+                models.append({
+                    "id": d.name,
+                    "object": "model"
+                })
+    return {"data": models}
+
+@app.get("/v1/models/{name}")
+async def get_model(name: str):
+    d = MODELS_DIR / name
+    meta = {}
+    if d.is_dir():
+        meta_file = d / "meta.json"
+        if meta_file.exists():
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {
+            "id": name,
             "object": "model",
             "owned_by": "fishaudio",
-            "meta": {
-                "quantization": "Q6_K",
-                "backend": "triton-fused-gemv",
-                "device": str(state.device),
-            }
-        }]
-    }
+            "meta": meta
+        }
+    elif (MODELS_DIR / f"{name}.gguf").exists():
+        return {
+            "id": name,
+            "object": "model",
+            "owned_by": "fishaudio",
+            "meta": {}
+        }
+    raise HTTPException(404, f"Model '{name}' not found")
+
+@app.post("/v1/models/{name}/load")
+async def load_model_endpoint(name: str):
+    global args
+    try:
+        load_models(args, name)
+        return {"message": f"Model '{name}' loaded successfully", "vram_gb": round(torch.cuda.memory_allocated() / 1e9, 2) if torch.cuda.is_available() else 0}
+    except FileNotFoundError:
+        raise HTTPException(404, f"Model '{name}' not found")
+    except Exception as e:
+        logger.exception("Failed to load model")
+        raise HTTPException(500, f"Failed to load model: {str(e)}")
+
+@app.post("/v1/models/{name}/unload")
+async def unload_model_endpoint(name: str):
+    if state.active_name != name:
+        raise HTTPException(400, f"Model '{name}' is not currently loaded")
+    
+    logger.info("Unloading current model...")
+    state.ready = False
+    state.active_name = None
+    if state.model is not None:
+        del state.model
+        del state.codec
+        state.model = None
+        state.codec = None
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    return {"message": f"Model '{name}' unloaded successfully"}
+
+@app.delete("/v1/models/{name}")
+async def delete_model(name: str):
+    d = MODELS_DIR / name
+    if d.is_dir():
+        shutil.rmtree(d)
+        if state.active_name == name:
+            await unload_model_endpoint(name)
+        return {"message": f"Model '{name}' deleted successfully"}
+    elif (MODELS_DIR / f"{name}.gguf").exists():
+        (MODELS_DIR / f"{name}.gguf").unlink()
+        if state.active_name == name:
+            await unload_model_endpoint(name)
+        return {"message": f"Model '{name}' deleted successfully"}
+    raise HTTPException(404, f"Model '{name}' not found")
+
+
 
 
 # ============================================================
@@ -884,8 +1134,8 @@ async def list_models():
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fish Speech GGUF API Server")
-    parser.add_argument("--gguf-path", type=str, required=True,
-                        help="Path to GGUF model file")
+    parser.add_argument("--model-name", type=str, default="s2-pro-q6_k",
+                        help="Model to load on startup")
     parser.add_argument("--codec-path", type=str, default=None,
                         help="Path to codec.pth (optional: uses GGUF-embedded codec if omitted)")
     parser.add_argument("--listen", type=str, default="0.0.0.0:7820",
@@ -934,8 +1184,14 @@ if __name__ == "__main__":
         logger.error(f"Port {port} is already in use: {e}")
         sys.exit(1)
 
+    # Initialize models directory
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
     # Load models (heavy operation)
-    load_models(args)
+    if args.model_name:
+        load_models(args, args.model_name)
+    else:
+        logger.info("Starting without an active model. Use POST /v1/models/{id}/load to load one.")
 
     logger.info(f"Starting server on {host}:{port}")
     uvicorn.run(app, host=host, port=port, workers=args.workers, log_level="info")

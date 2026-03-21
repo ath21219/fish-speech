@@ -10,11 +10,13 @@ services:
       - "7820:7820"
 
     volumes:
-      - ./models/gguf:/app/models/gguf:ro
+      - ./models:/app/models:rw
       - ./references:/app/references:rw
 
     environment:
-      - GGUF_MODEL_PATH=/app/models/gguf/s2-pro-q3_k_s.gguf
+      - MODEL_NAME=s2-pro-q6_k
+      # Codec is loaded from GGUF by default. Set CODEC_PATH to use external codec.pth
+      # - CODEC_PATH=/app/checkpoints/s2-pro/codec.pth
       - API_HOST=0.0.0.0
       - API_PORT=7820
       - MAX_SEQ_LEN=2048

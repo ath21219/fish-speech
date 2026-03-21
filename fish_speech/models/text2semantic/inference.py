@@ -93,6 +93,20 @@ def sample(
     return idx_next, probs
 
 
+def _ensure_decode_buffers(model, device, dtype):
+    """Pre-allocate reusable tensors for decode_one_token_ar (called once)."""
+    if hasattr(model, '_decode_bufs'):
+        return
+    model._decode_bufs = {
+        'high_temp': torch.tensor(RAS_HIGH_TEMP, device=device, dtype=dtype),
+        'high_top_p': torch.tensor(RAS_HIGH_TOP_P, device=device, dtype=dtype),
+        'fast_pos': [
+            torch.tensor([i], device=device, dtype=torch.long)
+            for i in range(model.config.num_codebooks)
+        ],
+    }
+
+
 def decode_one_token_ar(
     model: DualARTransformer,
     x: torch.Tensor,
@@ -105,6 +119,10 @@ def decode_one_token_ar(
     audio_parts: torch.Tensor,
     previous_tokens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    # Lazy-init reusable buffers (once per session)
+    _ensure_decode_buffers(model, x.device, temperature.dtype)
+    bufs = model._decode_bufs
+
     forward_result = model.forward_generate(
         x,
         input_pos,
@@ -123,12 +141,8 @@ def decode_one_token_ar(
     )[0]
 
     # RAS: also sample with high temp to use as fallback if token repeats
-    high_temp = torch.tensor(
-        RAS_HIGH_TEMP, device=temperature.device, dtype=temperature.dtype
-    )
-    high_top_p = torch.tensor(RAS_HIGH_TOP_P, device=top_p.device, dtype=top_p.dtype)
     main_token_high = sample(
-        biased_logits, temperature=high_temp, top_p=high_top_p, top_k=top_k
+        biased_logits, temperature=bufs['high_temp'], top_p=bufs['high_top_p'], top_k=top_k
     )[0]
 
     # Use high-temp sample if: token is semantic AND token is in previous window
@@ -145,8 +159,7 @@ def decode_one_token_ar(
 
     codebooks = [main_token_normal]
 
-    input_pos = torch.tensor([0], device=hidden_states.device, dtype=torch.long)
-    model.forward_generate_fast(hidden_states, input_pos)
+    model.forward_generate_fast(hidden_states, bufs['fast_pos'][0])
 
     a = codebooks[0] - model.config.semantic_begin_id
     a = torch.clamp(a, min=0, max=model.config.codebook_size - 1)
@@ -155,16 +168,11 @@ def decode_one_token_ar(
     codebooks.append(a)
 
     for codebook_idx in range(1, model.config.num_codebooks):
-        input_pos = torch.tensor(
-            [codebook_idx], device=hidden_states.device, dtype=torch.long
-        )
-        logits = model.forward_generate_fast(hidden_states, input_pos)
-
-        short_logits = logits  # DualAR predicts config.codebook_size number of tokens
+        logits = model.forward_generate_fast(hidden_states, bufs['fast_pos'][codebook_idx])
 
         # Convert logits to probs (no constrain for fast codebooks)
         a = sample(
-            short_logits,
+            logits,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -173,12 +181,7 @@ def decode_one_token_ar(
         hidden_states = model.fast_embeddings(a)
         codebooks.append(a)
 
-    codebooks = torch.stack(codebooks, dim=1)
-
-    # Only delete references, let Python GC handle cleanup
-    del logits, hidden_states, forward_result
-
-    return codebooks.T
+    return torch.stack(codebooks, dim=1).T
 
 
 def decode_n_tokens(
@@ -206,6 +209,9 @@ def decode_n_tokens(
     # [MODIFIED] Pre-fetch ID for efficiency loop
     im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
 
+    # Pre-allocate RAS window write position counter
+    ras_pos = 0
+
     for i in tqdm(range(num_new_tokens)):
         with sdpa_kernel(SDPBackend.MATH):
             next_token = decode_one_token(
@@ -219,15 +225,15 @@ def decode_n_tokens(
                 semantic_logit_bias=semantic_logit_bias,
                 audio_masks=audio_masks,
                 audio_parts=audio_parts,
-            ).clone()
+            )
 
         input_pos += 1
         cur_token = next_token.view(1, model.config.num_codebooks + 1, -1)
-        # Roll RAS window left and insert new token at end
-        previous_tokens = previous_tokens.roll(-1, dims=1)
-        previous_tokens[:, -1] = next_token.view(model.config.num_codebooks + 1, -1)[
-            :, 0
-        ]
+        # Circular buffer for RAS window (avoids roll which creates new tensors)
+        previous_tokens[:, ras_pos % RAS_WIN_SIZE] = next_token.view(
+            model.config.num_codebooks + 1, -1
+        )[:, 0]
+        ras_pos += 1
         new_tokens.append(next_token)
 
         if cur_token[0, 0, -1] == im_end_id:

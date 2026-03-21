@@ -33,14 +33,16 @@ from fish_speech.gguf.triton_kernels import (
     triton_dequant_q6k as _triton_dequant_q6k,
     fused_dequant_gemv_q6k,
     fused_dequant_gemv_q3k,
+    triton_dequant_q3k as _triton_dequant_q3k,
 )
 
 if _TRITON_AVAILABLE:
     logger.info("Triton Q6_K/Q3_K kernels loaded (dequant + fused GEMV)")
-
 else:
     _triton_dequant_q6k = None
+    _triton_dequant_q3k = None
     fused_dequant_gemv_q6k = None
+    fused_dequant_gemv_q3k = None
     logger.debug("Triton not available, using PyTorch dequant for Q6_K")
 
 
@@ -234,10 +236,19 @@ class GGUFParameter:
         if (
             _TRITON_AVAILABLE
             and _triton_dequant_q6k is not None
-            and self.qtype == 14  # Q6_K
+            and self.qtype == gguf.GGMLQuantizationType.Q6_K
             and self.data.is_cuda
         ):
             return _triton_dequant_q6k(self.data, self.shape, dtype)
+
+        # ---- Q3_K Triton dequant (追加) ----
+        if (
+            _TRITON_AVAILABLE
+            and _triton_dequant_q3k is not None
+            and self.qtype == gguf.GGMLQuantizationType.Q3_K
+            and self.data.is_cuda
+        ):
+            return _triton_dequant_q3k(self.data, self.shape, dtype)
 
         # Fallback: PyTorch dequant
         fn = DEQUANT_FN[self.qtype]
@@ -250,6 +261,9 @@ class GGUFParameter:
 class GGUFLinear(nn.Module):
     """Linear layer with GGUF quantized weights and generation-phase caching."""
 
+    # Class-level path tracking for diagnostics (set once per qtype)
+    _path_logged: set = set()
+
     def __init__(self, qparam: GGUFParameter, bias=None):
         super().__init__()
         self.qparam = qparam
@@ -257,6 +271,16 @@ class GGUFLinear(nn.Module):
         self._cached_weight: torch.Tensor | None = None
         self._cache_dtype: torch.dtype | None = None
         self._cache_enabled: bool = False  # Only cache during generation
+
+    def _log_path(self, path_name: str):
+        key = (self.qparam.qtype.name, path_name)
+        if key not in GGUFLinear._path_logged:
+            GGUFLinear._path_logged.add(key)
+            logger.info(
+                f"GGUFLinear path: {path_name} "
+                f"(qtype={self.qparam.qtype.name}, "
+                f"shape={self.qparam.shape})"
+            )
 
     def forward(self, x):
         if self._cache_enabled and self._cached_weight is not None and self._cache_dtype == x.dtype:
@@ -266,11 +290,12 @@ class GGUFLinear(nn.Module):
         # Fused GEMV path: batch=1, Q6_K
         if (
             _TRITON_AVAILABLE
-            and self.qparam.qtype == 14  # Q6_K
+            and self.qparam.qtype == gguf.GGMLQuantizationType.Q6_K
             and self.qparam.data.is_cuda
             and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1
             and self.qparam.shape[1] % 256 == 0
         ):
+            self._log_path("fused_gemv_q6k")
             out = fused_dequant_gemv_q6k(
                 x.view(-1), self.qparam.data,
                 self.qparam.shape[1], self.qparam.shape[0], dtype=x.dtype,
@@ -281,14 +306,17 @@ class GGUFLinear(nn.Module):
             return out
 
         # Fused GEMV path: batch=1, Q3_K
+        # NOTE: Triton JIT compilation makes the first call slow.
+        # Use warmup_triton_kernels() at model load time to avoid this.
         if (
             _TRITON_AVAILABLE
             and fused_dequant_gemv_q3k is not None
-            and self.qparam.qtype == 10  # Q3_K
+            and self.qparam.qtype == gguf.GGMLQuantizationType.Q3_K
             and self.qparam.data.is_cuda
             and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1
             and self.qparam.shape[1] % 256 == 0
         ):
+            self._log_path("fused_gemv_q3k")
             out = fused_dequant_gemv_q3k(
                 x.view(-1), self.qparam.data,
                 self.qparam.shape[1], self.qparam.shape[0], dtype=x.dtype,
@@ -299,6 +327,7 @@ class GGUFLinear(nn.Module):
             return out
 
         # Fallback: dequant + F.linear
+        self._log_path(f"fallback_dequant (x.shape={list(x.shape)})")
         w = self.qparam.dequantize(dtype=x.dtype)
         if w.device != x.device:
             w = w.to(x.device)
@@ -441,3 +470,53 @@ def clear_all_caches(model: nn.Module) -> int:
             module.disable_cache()
             count += 1
     return count
+
+
+def warmup_triton_kernels(model: nn.Module, dtype: torch.dtype = torch.float16) -> None:
+    """Pre-compile Triton kernels by running dummy inference on each unique shape.
+
+    Triton JIT compiles kernels on first use, which can add significant
+    latency (seconds per unique shape). Calling this at model load time
+    ensures all kernels are compiled before the first real inference.
+    """
+    if not _TRITON_AVAILABLE:
+        return
+
+    seen_shapes: set[tuple[int, int, str]] = set()
+    device = None
+
+    for module in model.modules():
+        if not isinstance(module, GGUFLinear):
+            continue
+        qp = module.qparam
+        if not qp.data.is_cuda:
+            continue
+
+        key = (qp.shape[0], qp.shape[1], qp.qtype.name)
+        if key in seen_shapes:
+            continue
+        seen_shapes.add(key)
+        device = qp.data.device
+
+        D_out, D_in = qp.shape
+        if D_in % 256 != 0:
+            continue
+
+        # Warmup: run fused GEMV + standalone dequant with dummy data
+        x_dummy = torch.randn(D_in, dtype=dtype, device=device)
+
+        if qp.qtype == gguf.GGMLQuantizationType.Q6_K and fused_dequant_gemv_q6k:
+            fused_dequant_gemv_q6k(x_dummy, qp.data, D_in, D_out, dtype=dtype)
+
+        if qp.qtype == gguf.GGMLQuantizationType.Q3_K and fused_dequant_gemv_q3k:
+            fused_dequant_gemv_q3k(x_dummy, qp.data, D_in, D_out, dtype=dtype)
+
+        # Also warmup standalone dequant (used during prefill)
+        _ = qp.dequantize(dtype=dtype)
+
+    if device is not None:
+        torch.cuda.synchronize(device)
+
+    logger.info(
+        f"Triton kernel warmup complete: {len(seen_shapes)} unique shapes compiled"
+    )
