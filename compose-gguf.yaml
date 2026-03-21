@@ -11,12 +11,10 @@ services:
 
     volumes:
       - ./models/gguf:/app/models/gguf:ro
-      - ./checkpoints/s2-pro:/app/checkpoints/s2-pro:ro
       - ./references:/app/references:rw
 
     environment:
-      - GGUF_MODEL_PATH=/app/models/gguf/s2-pro-q6_k.gguf
-      - CODEC_PATH=/app/checkpoints/s2-pro/codec.pth
+      - GGUF_MODEL_PATH=/app/models/gguf/s2-pro-q3_k_s.gguf
       - API_HOST=0.0.0.0
       - API_PORT=7820
       - MAX_SEQ_LEN=2048

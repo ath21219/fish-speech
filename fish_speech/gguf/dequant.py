@@ -32,10 +32,12 @@ from fish_speech.gguf.triton_kernels import (
     _TRITON_AVAILABLE,
     triton_dequant_q6k as _triton_dequant_q6k,
     fused_dequant_gemv_q6k,
+    fused_dequant_gemv_q3k,
 )
 
 if _TRITON_AVAILABLE:
-    logger.info("Triton Q6_K kernels loaded (dequant + fused GEMV)")
+    logger.info("Triton Q6_K/Q3_K kernels loaded (dequant + fused GEMV)")
+
 else:
     _triton_dequant_q6k = None
     fused_dequant_gemv_q6k = None
@@ -261,20 +263,35 @@ class GGUFLinear(nn.Module):
             w = self._cached_weight
             return F.linear(x, w, self.bias)
 
-        # Fused GEMV path: batch=1 の Q6_K 層で使用
+        # Fused GEMV path: batch=1, Q6_K
         if (
             _TRITON_AVAILABLE
             and self.qparam.qtype == 14  # Q6_K
             and self.qparam.data.is_cuda
-            and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1  # [1,1,D]
+            and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1
             and self.qparam.shape[1] % 256 == 0
         ):
             out = fused_dequant_gemv_q6k(
-                x.view(-1),
-                self.qparam.data,
-                self.qparam.shape[1],  # D_in
-                self.qparam.shape[0],  # D_out
-                dtype=x.dtype,
+                x.view(-1), self.qparam.data,
+                self.qparam.shape[1], self.qparam.shape[0], dtype=x.dtype,
+            )
+            out = out.view(1, 1, -1)
+            if self.bias is not None:
+                out = out + self.bias
+            return out
+
+        # Fused GEMV path: batch=1, Q3_K
+        if (
+            _TRITON_AVAILABLE
+            and fused_dequant_gemv_q3k is not None
+            and self.qparam.qtype == 10  # Q3_K
+            and self.qparam.data.is_cuda
+            and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1
+            and self.qparam.shape[1] % 256 == 0
+        ):
+            out = fused_dequant_gemv_q3k(
+                x.view(-1), self.qparam.data,
+                self.qparam.shape[1], self.qparam.shape[0], dtype=x.dtype,
             )
             out = out.view(1, 1, -1)
             if self.bias is not None:

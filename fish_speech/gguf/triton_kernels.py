@@ -23,6 +23,235 @@ except ImportError:
 if _TRITON_AVAILABLE:
 
     # ================================================================
+    #  Q3_K block layout (110 bytes per 256 values)
+    #  hmask[32]  bytes 0..31    high-bit mask
+    #  qs[64]     bytes 32..95   2-bit quantized values
+    #  scales[12] bytes 96..107  packed 6-bit scales (16 values)
+    #  d[2]       bytes 108..109 super-block scale (float16)
+    # ================================================================
+
+    @triton.jit
+    def _decode_q3k_scales(block_ptr):
+        """Decode 16 x 6-bit scales from 12 packed bytes.
+
+        Layout:
+          ls[0..7]:   bytes 96..103  — low nibbles
+          hs[0..3]:   bytes 104..107 — high 2-bit pairs
+
+        Scale[i] = (ls_low[i] & 0x0F) | ((hs_bits[i] & 0x03) << 4) - 32
+        """
+        # Load low-scale bytes (8 bytes → 16 nibbles)
+        ls0 = tl.load(block_ptr + 96).to(tl.uint8)
+        ls1 = tl.load(block_ptr + 97).to(tl.uint8)
+        ls2 = tl.load(block_ptr + 98).to(tl.uint8)
+        ls3 = tl.load(block_ptr + 99).to(tl.uint8)
+        ls4 = tl.load(block_ptr + 100).to(tl.uint8)
+        ls5 = tl.load(block_ptr + 101).to(tl.uint8)
+        ls6 = tl.load(block_ptr + 102).to(tl.uint8)
+        ls7 = tl.load(block_ptr + 103).to(tl.uint8)
+
+        # Load high-scale bytes (4 bytes → 16 x 2-bit)
+        hs0 = tl.load(block_ptr + 104).to(tl.uint8)
+        hs1 = tl.load(block_ptr + 105).to(tl.uint8)
+        hs2 = tl.load(block_ptr + 106).to(tl.uint8)
+        hs3 = tl.load(block_ptr + 107).to(tl.uint8)
+
+        # Low nibbles: scale[0]=ls0&0xF, scale[8]=ls0>>4, etc.
+        s0  = ls0 & 0x0F;  s8  = (ls0 >> 4) & 0x0F
+        s1  = ls1 & 0x0F;  s9  = (ls1 >> 4) & 0x0F
+        s2  = ls2 & 0x0F;  s10 = (ls2 >> 4) & 0x0F
+        s3  = ls3 & 0x0F;  s11 = (ls3 >> 4) & 0x0F
+        s4  = ls4 & 0x0F;  s12 = (ls4 >> 4) & 0x0F
+        s5  = ls5 & 0x0F;  s13 = (ls5 >> 4) & 0x0F
+        s6  = ls6 & 0x0F;  s14 = (ls6 >> 4) & 0x0F
+        s7  = ls7 & 0x0F;  s15 = (ls7 >> 4) & 0x0F
+
+        # High 2-bit pairs
+        h0  = hs0 & 0x03;        h4  = (hs0 >> 2) & 0x03
+        h8  = (hs0 >> 4) & 0x03; h12 = (hs0 >> 6) & 0x03
+        h1  = hs1 & 0x03;        h5  = (hs1 >> 2) & 0x03
+        h9  = (hs1 >> 4) & 0x03; h13 = (hs1 >> 6) & 0x03
+        h2  = hs2 & 0x03;        h6  = (hs2 >> 2) & 0x03
+        h10 = (hs2 >> 4) & 0x03; h14 = (hs2 >> 6) & 0x03
+        h3  = hs3 & 0x03;        h7  = (hs3 >> 2) & 0x03
+        h11 = (hs3 >> 4) & 0x03; h15 = (hs3 >> 6) & 0x03
+
+        # Combine: 6-bit scale = low4 | (high2 << 4), then subtract 32
+        # Return as tuple of 16 int8-range values
+        return (
+            (s0  | (h0  << 4)).to(tl.int8) - 32,
+            (s1  | (h1  << 4)).to(tl.int8) - 32,
+            (s2  | (h2  << 4)).to(tl.int8) - 32,
+            (s3  | (h3  << 4)).to(tl.int8) - 32,
+            (s4  | (h4  << 4)).to(tl.int8) - 32,
+            (s5  | (h5  << 4)).to(tl.int8) - 32,
+            (s6  | (h6  << 4)).to(tl.int8) - 32,
+            (s7  | (h7  << 4)).to(tl.int8) - 32,
+            (s8  | (h8  << 4)).to(tl.int8) - 32,
+            (s9  | (h9  << 4)).to(tl.int8) - 32,
+            (s10 | (h10 << 4)).to(tl.int8) - 32,
+            (s11 | (h11 << 4)).to(tl.int8) - 32,
+            (s12 | (h12 << 4)).to(tl.int8) - 32,
+            (s13 | (h13 << 4)).to(tl.int8) - 32,
+            (s14 | (h14 << 4)).to(tl.int8) - 32,
+            (s15 | (h15 << 4)).to(tl.int8) - 32,
+        )
+
+    @triton.jit
+    def _decode_q3k_chunk(
+        block_ptr, chunk_idx: tl.constexpr, offsets_16, d_scale, sc, DTYPE: tl.constexpr,
+    ):
+        """Decode 16 values from one of 16 sub-blocks within a Q3_K block.
+
+        Q3_K packing for qs (2-bit, 64 bytes for 256 values):
+          qs[i] contains 4 x 2-bit values via shifts 0,2,4,6
+          Byte index = chunk_idx // 4 * 32 + offsets_16  (for first 16 of 32)
+                     or chunk_idx // 4 * 32 + offsets_16 + 16 (for second 16)
+
+        hmask (1-bit, 32 bytes for 256 values):
+          Bit position = chunk_idx % 8
+          Byte index = chunk_idx // 8 * 32 + value_offset_within_32
+
+        q_val = (ql & 3) - 4 * (1 - hbit)
+        """
+        # Which of the 4 shift groups (0,2,4,6) and which 32-byte row
+        shift = (chunk_idx % 4) * 2
+        qs_row = chunk_idx // 4  # 0..3
+
+        # For chunks 0-7: values map to first/second half within a 32-byte row
+        is_upper = (chunk_idx % 2)  # 0 or 1 (first/second 16 of 32)
+
+        # qs byte offset
+        qs_byte_off = 32 + qs_row * 32 + is_upper * 16 + offsets_16
+
+        # hmask byte offset: bit (chunk_idx % 8) of byte at hmask_row * 32 + offset
+        hmask_row = chunk_idx // 8  # 0..1
+        hmask_bit = chunk_idx % 8
+        hmask_byte_off = hmask_row * 32 + is_upper * 16 + offsets_16
+
+        # Load and decode
+        qs_bytes = tl.load(block_ptr + qs_byte_off)
+        ql = (qs_bytes >> shift) & 0x03
+
+        hmask_bytes = tl.load(block_ptr + hmask_byte_off)
+        hbit = (hmask_bytes >> hmask_bit) & 0x01
+        # hbit=1 means subtract 0 (no offset), hbit=0 means subtract 4
+        hbit_inv = hbit ^ 0x01  # invert: 1->0, 0->1
+
+        q_val = ql.to(tl.int8) - (hbit_inv << 2).to(tl.int8)
+
+        return (d_scale * sc.to(DTYPE)) * q_val.to(DTYPE)
+
+    # ================================================================
+    #  Q3_K fused dequant + GEMV (batch=1 decode)
+    #  Based on blepping's KernelImpl_Q3_K design
+    # ================================================================
+
+    @triton.jit
+    def _fused_dequant_gemv_q3k_kernel(
+        input_ptr,
+        q_weight_ptr,
+        output_ptr,
+        D_in: tl.constexpr,
+        D_out,
+        BLOCK_SIZE_Q3K: tl.constexpr,  # 110
+        VALS_PER_BLOCK: tl.constexpr,  # 256
+        DTYPE: tl.constexpr,
+    ):
+        row_idx = tl.program_id(0)
+        if row_idx >= D_out:
+            return
+
+        n_blocks_per_row: tl.constexpr = D_in // VALS_PER_BLOCK
+        offsets_16 = tl.arange(0, 16)
+        acc = tl.zeros([16], dtype=tl.float32)
+
+        for block_idx in range(n_blocks_per_row):
+            block_byte_offset = (row_idx * n_blocks_per_row + block_idx) * BLOCK_SIZE_Q3K
+            block_ptr = q_weight_ptr + block_byte_offset
+            input_base = block_idx * VALS_PER_BLOCK
+
+            hmask_ptr = block_ptr
+            qs_ptr = block_ptr + 32
+            scales_ptr = block_ptr + 96
+            d_ptr = block_ptr + 108
+
+            d_super_scale = tl.load(d_ptr.to(tl.pointer_type(tl.float16))).to(DTYPE)
+
+            for chunk_idx in tl.static_range(16):
+                # --- Scale unpacking (same as blepping) ---
+                lscale_byte_index = chunk_idx % 8
+                lscale_shift = (chunk_idx // 8) * 4
+                lscale_byte = tl.load(scales_ptr + lscale_byte_index)
+                lscale_nibble = (lscale_byte >> lscale_shift) & 0x0F
+
+                hscale_byte_index = chunk_idx % 4
+                hscale_shift_index = chunk_idx // 4
+                hscale_byte = tl.load(scales_ptr + 8 + hscale_byte_index)
+                hscale_2bit = (hscale_byte >> (hscale_shift_index * 2)) & 0x03
+
+                scale_6bit = lscale_nibble | (hscale_2bit << 4)
+                final_scale = d_super_scale * (scale_6bit.to(tl.int8) - 32).to(DTYPE)
+
+                # --- ql (lower 2 bits) ---
+                flat_indices = chunk_idx * 16 + offsets_16
+
+                ql_source_row = flat_indices // 32
+                ql_source_col = flat_indices % 32
+                ql_segment = ql_source_row // 4
+                ql_shift_group = ql_source_row % 4
+
+                ql_byte_ptr = qs_ptr + ql_segment * 32 + ql_source_col
+                ql_byte = tl.load(ql_byte_ptr)
+                ql_vec = ((ql_byte >> (ql_shift_group * 2)) & 3).to(tl.int8)
+
+                # --- qh (high 1 bit, inverted) ---
+                qh_source_row = flat_indices // 32
+                qh_source_col = flat_indices % 32
+
+                qh_byte = tl.load(hmask_ptr + qh_source_col)
+                qh_vec = (((qh_byte >> qh_source_row) & 1) ^ 1).to(tl.int8)
+
+                # --- Combine ---
+                q_vec = ql_vec - (qh_vec << 2)
+                w_16 = final_scale * q_vec.to(DTYPE)
+
+                # --- Dot with input ---
+                x_16 = tl.load(input_ptr + input_base + chunk_idx * 16 + offsets_16)
+                acc += w_16.to(tl.float32) * x_16.to(tl.float32)
+
+        result = tl.sum(acc, axis=0).to(DTYPE)
+        tl.store(output_ptr + row_idx, result)
+
+    # ================================================================
+    #  Python wrappers for Q3_K
+    # ================================================================
+
+    def fused_dequant_gemv_q3k(
+        input_vec: torch.Tensor,
+        q_weight_data: torch.Tensor,
+        D_in: int,
+        D_out: int,
+        dtype: torch.dtype = torch.float16,
+    ) -> torch.Tensor:
+        assert D_in % 256 == 0, f"D_in must be multiple of 256, got {D_in}"
+        input_flat = input_vec.view(-1).contiguous()
+        output = torch.empty(D_out, device=input_vec.device, dtype=dtype)
+        TRITON_DTYPE = tl.float16 if dtype == torch.float16 else tl.bfloat16
+
+        _fused_dequant_gemv_q3k_kernel[(D_out,)](
+            input_flat,
+            q_weight_data,
+            output,
+            D_in=D_in,
+            D_out=D_out,
+            BLOCK_SIZE_Q3K=110,
+            VALS_PER_BLOCK=256,
+            DTYPE=TRITON_DTYPE,
+        )
+        return output
+
+    # ================================================================
     #  Q6_K chunk decoders (shared by both dequant and fused GEMV)
     # ================================================================
     # Each chunk decodes 32 values from a 210-byte Q6_K block.
@@ -290,3 +519,4 @@ else:
     # Triton not available — provide None stubs
     triton_dequant_q6k = None
     fused_dequant_gemv_q6k = None
+    fused_dequant_gemv_q3k = None

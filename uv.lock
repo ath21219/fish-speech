@@ -1146,7 +1146,7 @@ requires-dist = [
     { name = "descript-audiotools" },
     { name = "einops", specifier = ">=0.7.0" },
     { name = "einx", extras = ["torch"], specifier = "==0.2.2" },
-    { name = "gguf", specifier = ">=0.10.0" },
+    { name = "gguf", specifier = ">=0.6.0" },
     { name = "gradio", specifier = ">5.0.0" },
     { name = "grpcio", specifier = ">=1.58.0" },
     { name = "hydra-core", specifier = ">=1.3.2" },

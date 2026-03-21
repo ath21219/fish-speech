@@ -5,7 +5,6 @@ Triton-accelerated Q6_K inference with OpenAI-compatible TTS endpoint.
 Usage:
   python tools/api_server_gguf.py \
     --gguf-path ./models/gguf/s2-pro-q6_k.gguf \
-    --codec-path ./checkpoints/s2-pro/codec.pth \
     --listen 0.0.0.0:7820
 """
 
@@ -62,10 +61,10 @@ def codec_on_gpu():
     vram_after = torch.cuda.memory_allocated() / 1e9
     logger.info(f"Model offloaded in {time.perf_counter() - t0:.1f}s (VRAM: {vram_after:.2f} GB)")
 
-    # 2. Move codec to GPU
+    # 2. Move codec to GPU (already FP16, no dtype conversion needed)
     logger.info("Moving codec to GPU...")
     t0 = time.perf_counter()
-    codec.to(device=device, dtype=torch.float16)
+    codec.to(device=device)  # ← FP32変換不要
     torch.cuda.synchronize()
     vram = torch.cuda.memory_allocated() / 1e9
     logger.info(f"Codec on GPU in {time.perf_counter() - t0:.1f}s (VRAM: {vram:.2f} GB)")
@@ -73,7 +72,7 @@ def codec_on_gpu():
     try:
         yield codec
     finally:
-        pass  # Caller must call restore_model() explicitly
+        pass
 
 
 def restore_after_codec():
@@ -83,7 +82,7 @@ def restore_after_codec():
     device = state.device
 
     logger.info("Offloading codec to CPU...")
-    codec.to(device="cpu", dtype=torch.float32)
+    codec.to(device="cpu")  # ← FP16のまま（FP32戻し不要）
     torch.cuda.empty_cache()
 
     logger.info("Restoring GGUF model to GPU...")
@@ -176,7 +175,7 @@ app = FastAPI(title="Fish Speech GGUF API", version="1.0.0")
 def load_models(args):
     """Load GGUF model and codec at startup."""
     from fish_speech.gguf import load_gguf_model
-    from fish_speech.models.text2semantic.inference import load_codec_model
+    from fish_speech.gguf.dequant import dequantize_tensor
 
     logger.info("Loading GGUF model...")
     t0 = time.perf_counter()
@@ -197,29 +196,36 @@ def load_models(args):
     model = model.to(args.device)
     model._cache_setup_done = True
 
-    logger.info("Loading codec...")
-    t0 = time.perf_counter()
-    # load_codec_model has @torch.inference_mode() decorator,
-    # so we must re-create parameters as normal tensors
-    codec = load_codec_model(args.codec_path, "cpu", precision=torch.float32)
-
-    # Fix: convert all inference-mode tensors to normal tensors
-    for name, param in list(codec.named_parameters()):
-        parts = name.split('.')
-        module = codec
-        for part in parts[:-1]:
-            module = getattr(module, part)
-        setattr(module, parts[-1],
-                torch.nn.Parameter(param.data.clone(), requires_grad=False))
-
-    for name, buf in list(codec.named_buffers()):
-        parts = name.split('.')
-        module = codec
-        for part in parts[:-1]:
-            module = getattr(module, part)
-        module.register_buffer(parts[-1], buf.data.clone())
-
-    logger.info(f"Codec loaded in {time.perf_counter() - t0:.1f}s")
+    # -------------------------------------------------------
+    # Load codec from GGUF tensors (no codec.pth needed)
+    # -------------------------------------------------------
+    if args.codec_path:
+        # Legacy path: load from external codec.pth
+        logger.info(f"Loading codec from {args.codec_path}...")
+        t0 = time.perf_counter()
+        from fish_speech.models.text2semantic.inference import load_codec_model
+        codec = load_codec_model(args.codec_path, "cpu", precision=torch.float32)
+        # Fix inference-mode tensors (existing code)
+        for name, param in list(codec.named_parameters()):
+            parts = name.split('.')
+            module = codec
+            for part in parts[:-1]:
+                module = getattr(module, part)
+            setattr(module, parts[-1],
+                    torch.nn.Parameter(param.data.clone(), requires_grad=False))
+        for name, buf in list(codec.named_buffers()):
+            parts = name.split('.')
+            module = codec
+            for part in parts[:-1]:
+                module = getattr(module, part)
+            module.register_buffer(parts[-1], buf.data.clone())
+        logger.info(f"Codec loaded from .pth in {time.perf_counter() - t0:.1f}s")
+    else:
+        # New path: load from GGUF-embedded tensors
+        logger.info("Loading codec from GGUF tensors...")
+        t0 = time.perf_counter()
+        codec = _load_codec_from_gguf(model, device="cpu")
+        logger.info(f"Codec loaded from GGUF in {time.perf_counter() - t0:.1f}s")
 
     state.model = model
     state.tokenizer = model.tokenizer
@@ -232,6 +238,151 @@ def load_models(args):
     if torch.cuda.is_available():
         vram = torch.cuda.memory_allocated() / 1e9
         logger.info(f"Ready. VRAM: {vram:.2f} GB")
+
+
+def _load_codec_from_gguf(model, device="cpu"):
+    """
+    Build codec model structure via Hydra config, then load weights
+    from GGUF tensors stored in model._gguf_codec_tensors.
+
+    This replaces load_codec_model() + codec.pth, saving ~3.5 GB of
+    disk/memory overhead (codec.pth is FP32, GGUF has F16).
+    """
+    import gguf as gguf_lib
+    from fish_speech.gguf.dequant import dequantize_tensor, NATIVE_TORCH_QTYPES, DEQUANT_FN
+    from hydra.utils import instantiate
+    from omegaconf import OmegaConf
+    from torch.nn.utils import remove_weight_norm
+
+    codec_tensors = getattr(model, '_gguf_codec_tensors', None)
+    if not codec_tensors:
+        raise RuntimeError(
+            "No codec tensors found in GGUF. "
+            "Make sure the GGUF file contains c.* tensors."
+        )
+
+    # 1. Instantiate empty codec model from config
+    config_candidates = [
+        project_root / "fish_speech" / "configs" / "modded_dac_vq.yaml",
+        project_root / "configs" / "modded_dac_vq.yaml",
+        Path("/app/fish_speech/configs/modded_dac_vq.yaml"),
+        Path("/app/configs/modded_dac_vq.yaml"),
+    ]
+
+    # Also try resolving from the fish_speech package if possible
+    try:
+        import fish_speech
+        if hasattr(fish_speech, '__file__') and fish_speech.__file__ is not None:
+            config_candidates.insert(0,
+                Path(fish_speech.__file__).parent / "configs" / "modded_dac_vq.yaml"
+            )
+        elif hasattr(fish_speech, '__path__'):
+            for p in fish_speech.__path__:
+                config_candidates.insert(0,
+                    Path(p) / "configs" / "modded_dac_vq.yaml"
+                )
+    except Exception:
+        pass
+
+    config_path = None
+    for candidate in config_candidates:
+        if candidate.exists():
+            config_path = candidate
+            break
+
+    if config_path is None:
+        searched = "\n  ".join(str(c) for c in config_candidates)
+        raise FileNotFoundError(
+            f"Codec config modded_dac_vq.yaml not found. Searched:\n  {searched}"
+        )
+
+    logger.debug(f"Using codec config: {config_path}")
+    cfg = OmegaConf.load(str(config_path))
+    codec = instantiate(cfg)
+    codec.eval()
+
+    # 2. Remove weight_norm before loading (avoids weight_g/weight_v issues)
+    for module in codec.modules():
+        try:
+            remove_weight_norm(module)
+        except ValueError:
+            pass
+
+    # 3. Build state dict from GGUF codec tensors
+    gguf_state_dict = {}
+    for gguf_name, (raw_data, qtype, gguf_shape) in codec_tensors.items():
+        # Strip "c." prefix: "c.decoder.model.0.conv.weight" -> "decoder.model.0.conv.weight"
+        if gguf_name.startswith("c."):
+            param_name = gguf_name[2:]
+        else:
+            param_name = gguf_name
+
+        # Convert GGUF shape (reversed for 2D+) back to tensor
+        # Note: _gguf_tensor_to_raw in loader.py already reversed the shape,
+        # so 'gguf_shape' here is already in PyTorch convention
+        if qtype in NATIVE_TORCH_QTYPES:
+            if qtype == gguf_lib.GGMLQuantizationType.F16:
+                tensor = raw_data.view(torch.float16).reshape(gguf_shape)
+            elif qtype == gguf_lib.GGMLQuantizationType.F32:
+                tensor = raw_data.view(torch.float32).reshape(gguf_shape)
+            else:
+                tensor = raw_data.view(torch.bfloat16).reshape(gguf_shape)
+        elif qtype in DEQUANT_FN:
+            tensor = dequantize_tensor(raw_data, qtype, gguf_shape, dtype=torch.float16)
+        else:
+            logger.warning(f"Skipping codec tensor {param_name}: unsupported qtype {qtype}")
+            continue
+
+        gguf_state_dict[param_name] = tensor.to(device)
+
+    # 4. Load into codec model
+    # The GGUF exporter may have used slightly different naming than
+    # what Hydra creates. We need to handle potential mismatches.
+    codec_state = codec.state_dict()
+    loaded = 0
+    skipped = []
+
+    for param_name, param_tensor in gguf_state_dict.items():
+        if param_name in codec_state:
+            if codec_state[param_name].shape == param_tensor.shape:
+                codec_state[param_name] = param_tensor
+                loaded += 1
+            else:
+                # Shape mismatch — might be transposed (GGUF convention)
+                if (codec_state[param_name].shape == param_tensor.T.shape
+                        and param_tensor.dim() == 2):
+                    codec_state[param_name] = param_tensor.T
+                    loaded += 1
+                else:
+                    skipped.append(
+                        f"{param_name}: GGUF {param_tensor.shape} vs "
+                        f"model {codec_state[param_name].shape}"
+                    )
+        else:
+            skipped.append(f"{param_name}: not in model state_dict")
+
+    codec.load_state_dict(codec_state, strict=False)
+
+    logger.info(
+        f"Codec: loaded {loaded}/{len(gguf_state_dict)} tensors from GGUF, "
+        f"{len(skipped)} skipped"
+    )
+    if skipped and len(skipped) <= 20:
+        for s in skipped:
+            logger.debug(f"  Codec skip: {s}")
+
+    # 5. Move to target device/dtype
+    codec = codec.to(device=device, dtype=torch.float16)
+
+    # Verify essential attributes
+    if not hasattr(codec, 'sample_rate'):
+        # Fall back to GGUF metadata
+        meta = getattr(model, '_gguf_metadata', {})
+        sr = meta.get('fish_speech.codec.sample_rate', 44100)
+        codec.sample_rate = int(sr) if isinstance(sr, (int, float)) else 44100
+        logger.info(f"Set codec.sample_rate = {codec.sample_rate} from GGUF metadata")
+
+    return codec
 
 
 # ============================================================
@@ -428,6 +579,7 @@ def generate_speech(req: TTSRequest) -> np.ndarray:
 
         # Decode on CPU
         with torch.inference_mode():
+            logger.info(f"Decoding: codes shape={codes.shape}, codec device={next(state.codec.parameters()).device}, codec dtype={next(state.codec.parameters()).dtype}")
             audio_segment = decode_to_audio(codes.cpu(), state.codec)
         all_segments.append(audio_segment.float().cpu().numpy())
 
@@ -733,9 +885,9 @@ async def list_models():
 def parse_args():
     parser = argparse.ArgumentParser(description="Fish Speech GGUF API Server")
     parser.add_argument("--gguf-path", type=str, required=True,
-                        help="Path to Q6_K GGUF model file")
-    parser.add_argument("--codec-path", type=str, required=True,
-                        help="Path to codec.pth")
+                        help="Path to GGUF model file")
+    parser.add_argument("--codec-path", type=str, default=None,
+                        help="Path to codec.pth (optional: uses GGUF-embedded codec if omitted)")
     parser.add_argument("--listen", type=str, default="0.0.0.0:7820",
                         help="Host:port to listen on")
     parser.add_argument("--max-seq-len", type=int, default=2048,

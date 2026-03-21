@@ -4,8 +4,7 @@ set -euo pipefail
 log() { echo "[$(date +"%Y-%m-%d %H:%M:%S")] $*" >&2; }
 
 # Defaults (overridable via environment variables)
-GGUF_MODEL_PATH="${GGUF_MODEL_PATH:-/app/models/gguf/s2-pro-q6_k.gguf}"
-CODEC_PATH="${CODEC_PATH:-/app/checkpoints/s2-pro/codec.pth}"
+GGUF_MODEL_PATH="${GGUF_MODEL_PATH:-/app/models/gguf/s2-pro-q3_k_s.gguf}"
 API_HOST="${API_HOST:-0.0.0.0}"
 API_PORT="${API_PORT:-7820}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
@@ -15,12 +14,6 @@ MAX_TEXT_LENGTH="${MAX_TEXT_LENGTH:-0}"
 if [ ! -f "${GGUF_MODEL_PATH}" ]; then
     log "ERROR: GGUF model not found at ${GGUF_MODEL_PATH}"
     log "Mount your model: -v /path/to/models/gguf:/app/models/gguf"
-    exit 1
-fi
-
-if [ ! -f "${CODEC_PATH}" ]; then
-    log "ERROR: Codec not found at ${CODEC_PATH}"
-    log "Mount your codec: -v /path/to/checkpoints/s2-pro:/app/checkpoints/s2-pro"
     exit 1
 fi
 
