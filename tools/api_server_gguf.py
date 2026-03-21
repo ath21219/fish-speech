@@ -15,6 +15,9 @@ import time
 import base64
 from pathlib import Path
 from threading import Lock
+import asyncio
+import struct
+import threading
 
 
 import numpy as np
@@ -24,7 +27,7 @@ import uvicorn
 import json
 import shutil
 from fastapi import UploadFile, File, Form, FastAPI, HTTPException, Header
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import Response, JSONResponse, StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List
@@ -165,6 +168,10 @@ class HealthResponse(BaseModel):
 # ============================================================
 # Global state
 # ============================================================
+
+STREAM_CHUNK_TOKENS = 21
+STREAM_MIN_FIRST_CHUNK = 21
+AMPLITUDE = 32768
 
 class GGUFServerState:
     def __init__(self):
@@ -500,42 +507,49 @@ def _load_codec_from_gguf(model, device="cpu"):
 
 
 # ============================================================
-# TTS generation core (from working code, unchanged)
+# TTS generation core — streaming support
 # ============================================================
+import asyncio
+from fastapi.responses import StreamingResponse
 
-def generate_speech(req: TTSRequest) -> np.ndarray:
-    """Generate speech from text, returns numpy audio array."""
-    logger.info(f"generate_speech called: text={req.text[:50]}..., "
-                f"reference_id={req.reference_id}, "
-                f"references={len(req.references)}")
+# Streaming chunk size (in semantic tokens)
+# 21 tokens ≈ 1.0s audio at 44100Hz/512hop, ~5s generation time at 4.2 tok/s
+STREAM_CHUNK_TOKENS = 21
+
+# Minimum tokens before first chunk (for better audio quality at start)
+STREAM_MIN_FIRST_CHUNK = 21
+
+
+def generate_speech_streaming(req: TTSRequest):
+    """
+    Generator that yields (header_bytes, audio_chunk_bytes) tuples
+    as semantic tokens are produced. For non-streaming mode, collects
+    all chunks and returns concatenated audio.
+    """
     from fish_speech.content_sequence import TextPart, VQPart
     from fish_speech.conversation import Conversation, Message
     from fish_speech.models.text2semantic.inference import (
         decode_one_token_ar,
-        generate,
         decode_to_audio,
         encode_audio,
+        split_text_by_speaker,
+        group_turns_into_batches,
     )
     import tempfile
     import os
     import re
     from copy import deepcopy
-    from fish_speech.models.text2semantic.inference import (
-        split_text_by_speaker,
-        group_turns_into_batches,
-    )
 
     model = state.model
     tokenizer = state.tokenizer
     device = state.device
 
     # -------------------------------------------------------
-    # Load reference audio
+    # Reference loading (same as before)
     # -------------------------------------------------------
     prompt_tokens_list = []
     prompt_texts = []
 
-    # Reference encoding
     if req.references:
         logger.info(f"Encoding {len(req.references)} inline reference(s)...")
         with codec_on_gpu():
@@ -551,13 +565,11 @@ def generate_speech(req: TTSRequest) -> np.ndarray:
                         prompt_texts.append(ref.text)
                     finally:
                         os.unlink(f.name)
-        logger.info(f"Reference encoding done: {len(prompt_tokens_list)} ref(s)")
 
     elif req.reference_id:
         ref_dir = Path("references") / req.reference_id
         if not ref_dir.exists():
             raise ValueError(f"Reference '{req.reference_id}' not found")
-
         codes_cache = ref_dir / "codes.pt"
         if not codes_cache.exists():
             raise ValueError(
@@ -565,9 +577,7 @@ def generate_speech(req: TTSRequest) -> np.ndarray:
                 f"Please re-register the voice via POST /v1/voices"
             )
         codes = torch.load(codes_cache, map_location="cpu", weights_only=True)
-        logger.info(f"Loaded cached VQ codes: {codes.shape}")
         prompt_tokens_list.append(codes)
-
         ref_text = ""
         meta_file = ref_dir / "meta.json"
         if meta_file.exists():
@@ -584,7 +594,7 @@ def generate_speech(req: TTSRequest) -> np.ndarray:
     use_prompt = bool(prompt_texts) and bool(prompt_tokens_list)
 
     # -------------------------------------------------------
-    # Build conversation
+    # Build conversation (same as before)
     # -------------------------------------------------------
     base_conversation = Conversation()
 
@@ -621,7 +631,7 @@ def generate_speech(req: TTSRequest) -> np.ndarray:
     )
 
     # -------------------------------------------------------
-    # Split text into batches and generate
+    # Split text and generate with streaming decode
     # -------------------------------------------------------
     turns = split_text_by_speaker(req.text)
     batches = (
@@ -630,8 +640,9 @@ def generate_speech(req: TTSRequest) -> np.ndarray:
         else [req.text]
     )
 
-    all_segments = []
     conversation = deepcopy(base_conversation)
+    total_audio_samples = 0
+    chunk_count = 0
 
     for batch_idx, batch_text in enumerate(batches):
         logger.info(f"Batch {batch_idx}: {len(batch_text.encode('utf-8'))} bytes")
@@ -668,9 +679,12 @@ def generate_speech(req: TTSRequest) -> np.ndarray:
         if prompt_len > state.max_seq_len - 128:
             raise ValueError(f"Prompt too long: {prompt_len} tokens")
 
+        # --- Streaming token generation + decode ---
         t0 = time.perf_counter()
+        all_batch_codes = []
+
         with torch.inference_mode():
-            y = generate(
+            y = _generate_streaming(
                 model=model,
                 prompt=encoded,
                 max_new_tokens=req.max_new_tokens,
@@ -680,49 +694,266 @@ def generate_speech(req: TTSRequest) -> np.ndarray:
                 temperature=req.temperature,
                 top_p=req.top_p,
                 top_k=req.top_k,
+                codec=state.codec,
+                chunk_size=STREAM_CHUNK_TOKENS,
+                min_first_chunk=STREAM_MIN_FIRST_CHUNK,
+                streaming=req.streaming,
             )
-        t_gen = time.perf_counter() - t0
-        gen_tokens = y.shape[1] - prompt_len
-        logger.info(f"Generated {gen_tokens} tokens in {t_gen:.1f}s "
-                    f"({gen_tokens/t_gen:.1f} tok/s)")
 
-        codes = y[1:, prompt_len:-1].clone().clamp(min=0)
-        if codes.shape[1] == 0:
-            logger.warning(f"Batch {batch_idx}: no codes generated, skipping")
-            continue
-
-        # Decode audio from VQ codes
-        with torch.inference_mode():
-            codec_dev = next(state.codec.parameters()).device
-            logger.info(f"Decoding: codes shape={codes.shape}, "
-                        f"codec device={codec_dev}, "
-                        f"codec dtype={next(state.codec.parameters()).dtype}")
-            t_dec = time.perf_counter()
-            codes_for_decode = codes.to(codec_dev)
-            audio_segment = decode_to_audio(codes_for_decode, state.codec)
-            logger.info(f"Codec decode in {time.perf_counter() - t_dec:.2f}s")
-        all_segments.append(audio_segment.float().cpu().numpy())
+            for event in y:
+                if event["type"] == "codes":
+                    # Accumulated codes for conversation context
+                    all_batch_codes.append(event["codes"])
+                elif event["type"] == "audio_chunk":
+                    chunk_count += 1
+                    audio_np = event["audio"]
+                    total_audio_samples += len(audio_np)
+                    yield {
+                        "type": "audio",
+                        "data": audio_np,
+                        "chunk_idx": chunk_count,
+                    }
+                elif event["type"] == "stats":
+                    logger.info(
+                        f"Batch {batch_idx}: {event['tokens']} tokens in "
+                        f"{event['time']:.1f}s ({event['tok_per_sec']:.1f} tok/s)"
+                    )
 
         # Add back to conversation for multi-batch context
-        conversation.append(
-            Message(
-                role="assistant",
-                parts=[VQPart(codes=codes.cpu(), cal_loss=False)],
-                cal_loss=False,
-                modality="voice",
-                add_im_start=True,
-                add_im_end=True,
+        if all_batch_codes:
+            merged = torch.cat(all_batch_codes, dim=1)
+            conversation.append(
+                Message(
+                    role="assistant",
+                    parts=[VQPart(codes=merged.cpu(), cal_loss=False)],
+                    cal_loss=False,
+                    modality="voice",
+                    add_im_start=True,
+                    add_im_end=True,
+                )
             )
-        )
-        del y, encoded
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    if not all_segments:
+    duration = total_audio_samples / state.sample_rate if total_audio_samples > 0 else 0
+    logger.info(f"Streaming complete: {chunk_count} chunks, {duration:.1f}s audio")
+
+    if chunk_count == 0:
         raise ValueError("No audio generated")
 
-    return np.concatenate(all_segments, axis=0)
+
+# ============================================================
+# Streaming token generation with cumulative decode
+# ============================================================
+
+def _generate_streaming(
+    model,
+    prompt,
+    max_new_tokens,
+    audio_masks,
+    audio_parts,
+    decode_one_token,
+    temperature,
+    top_p,
+    top_k,
+    codec,
+    chunk_size=21,
+    min_first_chunk=21,
+    streaming=True,
+):
+    """
+    Token-by-token generation with streaming codec decode.
+
+    Uses StreamingCodecDecoder which:
+      - Processes post_module Transformer incrementally with KV cache (exact)
+      - Handles conv layers with overlap context (minimal artifacts)
+
+    Yields events:
+      {"type": "codes",       "codes": tensor}
+      {"type": "audio_chunk", "audio": np.ndarray}
+      {"type": "stats",       "tokens": int, "time": float, "tok_per_sec": float}
+    """
+    from fish_speech.models.text2semantic.inference import (
+        decode_one_token_ar,
+        _ensure_decode_buffers,
+        decode_to_audio,
+    )
+    from fish_speech.tokenizer import IM_END_TOKEN
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    device = prompt.device
+    dtype = next(model.parameters()).dtype
+    T = prompt.size(1)
+    codebook_dim = 1 + model.config.num_codebooks
+
+    if T >= model.config.max_seq_len:
+        raise ValueError(f"Input sequence length {T} exceeds max_seq_len")
+
+    effective_max = (
+        min(max_new_tokens, model.config.max_seq_len - T)
+        if max_new_tokens
+        else model.config.max_seq_len - T
+    )
+
+    # Setup LLM caches if needed
+    if not hasattr(model, "_cache_setup_done") or not model._cache_setup_done:
+        with torch.device(device):
+            model.setup_caches(
+                max_batch_size=1,
+                max_seq_len=model.config.max_seq_len,
+                dtype=dtype,
+            )
+        model._cache_setup_done = True
+
+    # Build semantic logit bias
+    vocab_size = model.config.vocab_size
+    semantic_logit_bias = torch.full(
+        (1, 1, vocab_size), float("-inf"), device=device, dtype=dtype
+    )
+    semantic_logit_bias[
+        0, 0, model.config.semantic_begin_id : model.config.semantic_end_id + 1
+    ] = 0.0
+    im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
+    semantic_logit_bias[0, 0, im_end_id] = 0.0
+
+    temperature_t = torch.tensor(temperature, device=device, dtype=dtype)
+    top_p_t = torch.tensor(top_p, device=device, dtype=dtype)
+
+    # --- Initialize streaming codec decoder ---
+    from fish_speech.models.dac.streaming_codec import StreamingCodecDecoder
+    streaming_decoder = StreamingCodecDecoder(
+        codec=codec,
+        device=str(next(codec.parameters()).device),
+        max_frames=effective_max + 64,
+    )
+
+    # Prefill
+    input_pos = torch.arange(0, T, device=device, dtype=torch.long)
+    prompt_3d = prompt[None].repeat(1, 1, 1)
+
+    # RAS window
+    RAS_WIN_SIZE = 10
+    previous_tokens = torch.zeros(
+        (codebook_dim, RAS_WIN_SIZE), dtype=torch.int, device=device
+    )
+    ras_pos = 0
+
+    # Generate first token (prefill)
+    first_token = decode_one_token(
+        model=model,
+        x=prompt_3d,
+        input_pos=input_pos,
+        temperature=temperature_t,
+        top_p=top_p_t,
+        top_k=top_k,
+        semantic_logit_bias=semantic_logit_bias,
+        audio_masks=audio_masks,
+        audio_parts=audio_parts,
+        previous_tokens=previous_tokens,
+    )
+
+    input_pos = torch.tensor([T], device=device, dtype=torch.long)
+    cur_token = first_token.view(1, codebook_dim, -1)
+    previous_tokens[:, ras_pos % RAS_WIN_SIZE] = first_token.view(codebook_dim, -1)[:, 0]
+    ras_pos += 1
+
+    # Token accumulation
+    all_new_tokens = [first_token]
+    pending_tokens = [first_token]
+    tokens_since_last_chunk = 1
+    total_tokens = 1
+    t0 = time.perf_counter()
+    is_first_chunk = True
+    finished = (first_token[0, 0] == im_end_id)
+
+    while not finished and total_tokens < effective_max:
+        with sdpa_kernel(SDPBackend.MATH):
+            next_token = decode_one_token(
+                model=model,
+                x=cur_token,
+                input_pos=input_pos,
+                temperature=temperature_t,
+                top_p=top_p_t,
+                top_k=top_k,
+                semantic_logit_bias=semantic_logit_bias,
+                audio_masks=audio_masks,
+                audio_parts=audio_parts,
+                previous_tokens=previous_tokens,
+            )
+
+        input_pos += 1
+        cur_token = next_token.view(1, codebook_dim, -1)
+        previous_tokens[:, ras_pos % RAS_WIN_SIZE] = next_token.view(codebook_dim, -1)[:, 0]
+        ras_pos += 1
+        total_tokens += 1
+
+        all_new_tokens.append(next_token)
+        pending_tokens.append(next_token)
+        tokens_since_last_chunk += 1
+
+        if cur_token[0, 0, -1] == im_end_id:
+            finished = True
+
+        # Check if we should emit a chunk
+        threshold = min_first_chunk if is_first_chunk else chunk_size
+        should_emit = (streaming and tokens_since_last_chunk >= threshold) or finished
+
+        if should_emit and pending_tokens:
+            # Stack pending tokens → (codebook_dim, N)
+            chunk_all = torch.cat(pending_tokens, dim=1)
+            codes_new = chunk_all[1:, :].clone().clamp(min=0)
+
+            if codes_new.shape[1] > 0:
+                t_dec = time.perf_counter()
+                audio_np = streaming_decoder.decode_chunk(codes_new)
+                t_dec_ms = (time.perf_counter() - t_dec) * 1000
+
+                if len(audio_np) > 0:
+                    chunk_duration = len(audio_np) / state.sample_rate
+                    logger.debug(
+                        f"Streaming decode: {codes_new.shape[1]} frames → "
+                        f"{chunk_duration:.2f}s audio in {t_dec_ms:.0f}ms"
+                    )
+                    yield {"type": "codes", "codes": codes_new.cpu()}
+                    yield {"type": "audio_chunk", "audio": audio_np}
+
+            pending_tokens = []
+            tokens_since_last_chunk = 0
+            is_first_chunk = False
+
+    t_total = time.perf_counter() - t0
+    yield {
+        "type": "stats",
+        "tokens": total_tokens,
+        "time": t_total,
+        "tok_per_sec": total_tokens / t_total if t_total > 0 else 0,
+    }
+
+    # Cleanup — remove KV caches from codec to free VRAM
+    streaming_decoder.reset()
+    del streaming_decoder, cur_token, all_new_tokens, pending_tokens
+
+
+# ============================================================
+# Replace generate_speech (non-streaming wrapper)
+# ============================================================
+
+def generate_speech(req: TTSRequest) -> np.ndarray:
+    """Non-streaming: collect all chunks, return concatenated audio."""
+    # Force non-streaming mode for this path
+    req_copy = req.model_copy()
+    req_copy.streaming = False
+
+    all_audio = []
+    for event in generate_speech_streaming(req_copy):
+        if event["type"] == "audio":
+            all_audio.append(event["data"])
+
+    if not all_audio:
+        raise ValueError("No audio generated")
+
+    return np.concatenate(all_audio, axis=0)
 
 
 # ============================================================
@@ -927,61 +1158,164 @@ async def delete_voice(name: str):
     return {"message": f"Voice '{name}' deleted successfully"}
 
 
+# ============================================================
+# Streaming TTS endpoint
+# ============================================================
+
 @app.post("/v1/tts")
 async def tts(req: TTSRequest):
     if not state.ready:
         raise HTTPException(status_code=503, detail="Model not ready")
-
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
 
     if req.streaming:
-        raise HTTPException(
-            status_code=400,
-            detail="Streaming not supported in GGUF mode. Set streaming=false."
+        # Streaming mode: return chunked audio as WAV fragments
+        return StreamingResponse(
+            _stream_tts(req),
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": "attachment; filename=speech.wav",
+                "Transfer-Encoding": "chunked",
+            },
+        )
+    else:
+        # Non-streaming mode (original behavior)
+        with state.lock:
+            try:
+                t0 = time.perf_counter()
+                audio_np = generate_speech(req)
+                t_total = time.perf_counter() - t0
+                duration = len(audio_np) / state.sample_rate
+                logger.info(
+                    f"TTS complete: {duration:.1f}s audio in {t_total:.1f}s "
+                    f"(RTF={t_total/duration:.2f})"
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            except Exception as e:
+                logger.opt(exception=True).error("Generation failed: {}", str(e))
+                raise HTTPException(status_code=500, detail="Generation failed")
+
+        buffer = io.BytesIO()
+        try:
+            sf.write(buffer, audio_np, state.sample_rate, format=req.format)
+        except Exception:
+            sf.write(buffer, audio_np, state.sample_rate, format="wav")
+            req.format = "wav"
+
+        content_type_map = {
+            "wav": "audio/wav",
+            "flac": "audio/flac",
+            "mp3": "audio/mpeg",
+        }
+        return Response(
+            content=buffer.getvalue(),
+            media_type=content_type_map.get(req.format, "audio/wav"),
+            headers={
+                "Content-Disposition": f"attachment; filename=speech.{req.format}",
+                "X-Audio-Duration": f"{duration:.2f}",
+                "X-Generation-Time": f"{t_total:.2f}",
+            },
         )
 
-    # Serialize generation (single GPU, no concurrent inference)
-    with state.lock:
+
+async def _stream_tts(req: TTSRequest):
+    """Async generator for streaming TTS response."""
+    import struct
+
+    loop = asyncio.get_event_loop()
+    sr = state.sample_rate
+    header_sent = False
+    total_samples = 0
+
+    def _run_generation():
+        """Run in thread to avoid blocking the event loop."""
+        with state.lock:
+            yield from generate_speech_streaming(req)
+
+    # We need to run the synchronous generator in a thread
+    # Use a queue to bridge sync generator → async generator
+    result_queue = asyncio.Queue()
+    stop_event = threading.Event()
+
+    def _worker():
         try:
-            t0 = time.perf_counter()
-            audio_np = generate_speech(req)
-            t_total = time.perf_counter() - t0
-            duration = len(audio_np) / state.sample_rate
-            logger.info(f"TTS complete: {duration:.1f}s audio in {t_total:.1f}s "
-                        f"(RTF={t_total/duration:.2f})")
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            with state.lock:
+                for event in generate_speech_streaming(req):
+                    loop.call_soon_threadsafe(result_queue.put_nowait, event)
+            loop.call_soon_threadsafe(result_queue.put_nowait, None)  # sentinel
         except Exception as e:
-            logger.opt(exception=True).error("Generation failed: {}", str(e))
-            raise HTTPException(status_code=500, detail="Generation failed")
+            loop.call_soon_threadsafe(
+                result_queue.put_nowait, {"type": "error", "error": str(e)}
+            )
 
-    # Encode to requested format
-    buffer = io.BytesIO()
+    worker_thread = threading.Thread(target=_worker, daemon=True)
+    worker_thread.start()
+
     try:
-        sf.write(buffer, audio_np, state.sample_rate, format=req.format)
-    except Exception:
-        # Fallback to wav if format not supported
-        sf.write(buffer, audio_np, state.sample_rate, format="wav")
-        req.format = "wav"
+        while True:
+            event = await result_queue.get()
+            if event is None:
+                break
+            if event.get("type") == "error":
+                raise HTTPException(status_code=500, detail=event["error"])
+            if event["type"] == "audio":
+                audio_np = event["data"]
 
-    content_type_map = {
-        "wav": "audio/wav",
-        "flac": "audio/flac",
-        "mp3": "audio/mpeg",
-    }
+                if not header_sent:
+                    # Send WAV header with unknown size (will be patched by client
+                    # or we use a very large placeholder)
+                    header = _make_wav_header(sr, 0x7FFFFFFF)  # max size placeholder
+                    yield header
+                    header_sent = True
 
-    return Response(
-        content=buffer.getvalue(),
-        media_type=content_type_map.get(req.format, "audio/wav"),
-        headers={
-            "Content-Disposition": f"attachment; filename=speech.{req.format}",
-            "X-Audio-Duration": f"{duration:.2f}",
-            "X-Generation-Time": f"{t_total:.2f}",
-        },
+                # Convert float audio to int16 PCM
+                audio_int16 = (audio_np * AMPLITUDE).clip(
+                    -AMPLITUDE, AMPLITUDE - 1
+                ).astype(np.int16)
+                yield audio_int16.tobytes()
+                total_samples += len(audio_int16)
+
+    except asyncio.CancelledError:
+        stop_event.set()
+    finally:
+        worker_thread.join(timeout=5)
+
+    if not header_sent:
+        raise HTTPException(status_code=400, detail="No audio generated")
+
+    logger.info(
+        f"Streamed {total_samples} samples "
+        f"({total_samples/sr:.1f}s) in {total_samples // sr + 1} chunks"
     )
 
 
+def _make_wav_header(sample_rate: int, data_size: int) -> bytes:
+    """Create a minimal WAV header for 16-bit mono PCM."""
+    import struct
+    channels = 1
+    bits_per_sample = 16
+    byte_rate = sample_rate * channels * bits_per_sample // 8
+    block_align = channels * bits_per_sample // 8
+
+    header = struct.pack(
+        '<4sI4s4sIHHIIHH4sI',
+        b'RIFF',
+        36 + data_size,        # ChunkSize
+        b'WAVE',
+        b'fmt ',
+        16,                    # Subchunk1Size (PCM)
+        1,                     # AudioFormat (PCM)
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b'data',
+        data_size,             # Subchunk2Size
+    )
+    return header
 
 
 @app.post("/v1/models")
