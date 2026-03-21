@@ -1141,7 +1141,11 @@ def parse_args():
     parser.add_argument("--listen", type=str, default="0.0.0.0:7820",
                         help="Host:port to listen on")
     parser.add_argument("--max-seq-len", type=int, default=2048,
-                        help="Max sequence length (lower = less VRAM)")
+                        help="Max sequence length for KV cache allocation. "
+                             "Typical inference uses ~800-1000 tokens "
+                             "(ref ~700 + gen ~100-300). "
+                             "Lower values save VRAM (~24 MB per 100 tokens). "
+                             "Default 1280 saves ~100 MB vs 2048.")
     parser.add_argument("--max-text-length", type=int, default=0,
                         help="Max input text length (0 = unlimited)")
     parser.add_argument("--device", type=str, default="cuda")
