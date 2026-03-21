@@ -312,6 +312,17 @@ def load_models(args, name=None):
                         f"{total_vram:.1f} GB VRAM)")
             state.codec_gpu_resident = False
 
+    # [OPT-B7] Enable custom_op mode for GGUFLinear modules.
+    # This registers fused GEMV kernels as torch custom ops, allowing
+    # torch.compile to include them in the computation graph without
+    # graph breaks. Must be called BEFORE any torch.compile invocation.
+    try:
+        from fish_speech.gguf.dequant import enable_custom_op_mode
+        enable_custom_op_mode(model)
+        logger.info("Custom op mode enabled for GGUFLinear")
+    except Exception as e:
+        logger.warning(f"Could not enable custom_op mode: {e}")
+
     # Pre-compile Triton kernels to avoid JIT latency on first inference
     from fish_speech.gguf.dequant import warmup_triton_kernels
     logger.info("Warming up Triton kernels...")
@@ -764,16 +775,12 @@ def _generate_streaming(
 ):
     """
     Token-by-token generation with streaming codec decode.
+    Uses StreamingCodecDecoder for incremental audio output.
 
-    Uses StreamingCodecDecoder which:
-      - Processes post_module Transformer incrementally with KV cache (exact)
-      - Handles conv layers with overlap context (minimal artifacts)
-
-    Yields events:
-      {"type": "codes",       "codes": tensor}
-      {"type": "audio_chunk", "audio": np.ndarray}
-      {"type": "stats",       "tokens": int, "time": float, "tok_per_sec": float}
+    [OPT-F19] tqdm removed, sdpa_kernel outside loop, batched im_end check.
+    [OPT-B6]  Fixed-address buffers for CUDA Graph compatibility.
     """
+    # --- imports (変更なし) ---
     from fish_speech.models.text2semantic.inference import (
         decode_one_token_ar,
         _ensure_decode_buffers,
@@ -782,6 +789,7 @@ def _generate_streaming(
     from fish_speech.tokenizer import IM_END_TOKEN
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
+    # --- setup (変更なし) ---
     device = prompt.device
     dtype = next(model.parameters()).dtype
     T = prompt.size(1)
@@ -796,7 +804,7 @@ def _generate_streaming(
         else model.config.max_seq_len - T
     )
 
-    # Setup LLM caches if needed
+    # Setup LLM caches if needed (変更なし)
     if not hasattr(model, "_cache_setup_done") or not model._cache_setup_done:
         with torch.device(device):
             model.setup_caches(
@@ -806,7 +814,7 @@ def _generate_streaming(
             )
         model._cache_setup_done = True
 
-    # Build semantic logit bias
+    # Build semantic logit bias (変更なし)
     vocab_size = model.config.vocab_size
     semantic_logit_bias = torch.full(
         (1, 1, vocab_size), float("-inf"), device=device, dtype=dtype
@@ -820,7 +828,7 @@ def _generate_streaming(
     temperature_t = torch.tensor(temperature, device=device, dtype=dtype)
     top_p_t = torch.tensor(top_p, device=device, dtype=dtype)
 
-    # --- Initialize streaming codec decoder ---
+    # Initialize streaming codec decoder (変更なし)
     from fish_speech.models.dac.streaming_codec import StreamingCodecDecoder
     streaming_decoder = StreamingCodecDecoder(
         codec=codec,
@@ -828,18 +836,16 @@ def _generate_streaming(
         max_frames=effective_max + 64,
     )
 
-    # Prefill
+    # --- Prefill (変更なし) ---
     input_pos = torch.arange(0, T, device=device, dtype=torch.long)
     prompt_3d = prompt[None].repeat(1, 1, 1)
 
-    # RAS window
     RAS_WIN_SIZE = 10
     previous_tokens = torch.zeros(
         (codebook_dim, RAS_WIN_SIZE), dtype=torch.int, device=device
     )
     ras_pos = 0
 
-    # Generate first token (prefill)
     first_token = decode_one_token(
         model=model,
         x=prompt_3d,
@@ -853,12 +859,10 @@ def _generate_streaming(
         previous_tokens=previous_tokens,
     )
 
-    input_pos = torch.tensor([T], device=device, dtype=torch.long)
-    cur_token = first_token.view(1, codebook_dim, -1)
     previous_tokens[:, ras_pos % RAS_WIN_SIZE] = first_token.view(codebook_dim, -1)[:, 0]
     ras_pos += 1
 
-    # Token accumulation
+    # --- Token accumulation state (変更なし) ---
     all_new_tokens = [first_token]
     pending_tokens = [first_token]
     tokens_since_last_chunk = 1
@@ -867,12 +871,27 @@ def _generate_streaming(
     is_first_chunk = True
     finished = (first_token[0, 0] == im_end_id)
 
-    while not finished and total_tokens < effective_max:
-        with sdpa_kernel(SDPBackend.MATH):
+    # ★変更ここから: OPT-F19 / OPT-B6 最適化
+
+    # [OPT-F19] GPU-side im_end comparison tensor
+    im_end_tensor = torch.tensor(im_end_id, dtype=torch.int, device=device)
+
+    # [OPT-B6] Fixed-address buffers for CUDA Graph compatibility
+    fixed_input_pos = torch.tensor([T], device=device, dtype=torch.long)
+    fixed_cur_token = first_token.view(1, codebook_dim, 1).clone()
+
+    # [OPT-F19] Batched im_end check buffer
+    CHECK_INTERVAL = 8
+    semantic_id_buffer = torch.empty(CHECK_INTERVAL, dtype=torch.int, device=device)
+    buf_pos = 0
+
+    # [OPT-F19] sdpa_kernel context outside loop
+    with sdpa_kernel(SDPBackend.MATH):
+        while not finished and total_tokens < effective_max:
             next_token = decode_one_token(
                 model=model,
-                x=cur_token,
-                input_pos=input_pos,
+                x=fixed_cur_token,                         # ★変更: 固定バッファ使用
+                input_pos=fixed_input_pos,                 # ★変更: 固定バッファ使用
                 temperature=temperature_t,
                 top_p=top_p_t,
                 top_k=top_k,
@@ -882,46 +901,87 @@ def _generate_streaming(
                 previous_tokens=previous_tokens,
             )
 
-        input_pos += 1
-        cur_token = next_token.view(1, codebook_dim, -1)
-        previous_tokens[:, ras_pos % RAS_WIN_SIZE] = next_token.view(codebook_dim, -1)[:, 0]
-        ras_pos += 1
-        total_tokens += 1
+            # [OPT-B6] In-place buffer updates (preserves tensor address)
+            fixed_input_pos.add_(1)                        # ★変更: += 1 ではなく .add_(1)
+            fixed_cur_token.copy_(                         # ★変更: = ではなく .copy_()
+                next_token.view(1, codebook_dim, 1)
+            )
 
-        all_new_tokens.append(next_token)
-        pending_tokens.append(next_token)
-        tokens_since_last_chunk += 1
+            previous_tokens[:, ras_pos % RAS_WIN_SIZE] = next_token.view(
+                codebook_dim, -1
+            )[:, 0]
+            ras_pos += 1
+            total_tokens += 1
 
-        if cur_token[0, 0, -1] == im_end_id:
-            finished = True
+            all_new_tokens.append(next_token)
+            pending_tokens.append(next_token)
+            tokens_since_last_chunk += 1
 
-        # Check if we should emit a chunk
-        threshold = min_first_chunk if is_first_chunk else chunk_size
-        should_emit = (streaming and tokens_since_last_chunk >= threshold) or finished
+            # [OPT-F19] Batched im_end check (replaces per-token GPU→CPU sync)
+            semantic_id_buffer[buf_pos] = next_token[0, 0]  # ★変更
+            buf_pos += 1                                     # ★変更
 
-        if should_emit and pending_tokens:
-            # Stack pending tokens → (codebook_dim, N)
+            if buf_pos >= CHECK_INTERVAL:                    # ★変更ここから
+                if (semantic_id_buffer[:buf_pos] == im_end_tensor).any().item():
+                    match_mask = (semantic_id_buffer[:buf_pos] == im_end_tensor)
+                    first_match = match_mask.nonzero(as_tuple=False)[0, 0].item()
+                    tokens_to_discard = buf_pos - first_match - 1
+                    if tokens_to_discard > 0:
+                        all_new_tokens = all_new_tokens[:-tokens_to_discard]
+                        pending_tokens = pending_tokens[:-tokens_to_discard]
+                        tokens_since_last_chunk -= tokens_to_discard
+                        total_tokens -= tokens_to_discard
+                    finished = True
+                buf_pos = 0                                  # ★変更ここまで
+
+            # --- Emit chunk (変更なし) ---
+            threshold = min_first_chunk if is_first_chunk else chunk_size
+            should_emit = (
+                (streaming and tokens_since_last_chunk >= threshold) or finished
+            )
+
+            if should_emit and pending_tokens:
+                chunk_all = torch.cat(pending_tokens, dim=1)
+                codes_new = chunk_all[1:, :].clone().clamp(min=0)
+
+                if codes_new.shape[1] > 0:
+                    t_dec = time.perf_counter()
+                    audio_np = streaming_decoder.decode_chunk(codes_new)
+                    t_dec_ms = (time.perf_counter() - t_dec) * 1000
+
+                    if len(audio_np) > 0:
+                        chunk_duration = len(audio_np) / state.sample_rate
+                        logger.debug(
+                            f"Streaming decode: {codes_new.shape[1]} frames → "
+                            f"{chunk_duration:.2f}s audio in {t_dec_ms:.0f}ms"
+                        )
+                        yield {"type": "codes", "codes": codes_new.cpu()}
+                        yield {"type": "audio_chunk", "audio": audio_np}
+
+                pending_tokens = []
+                tokens_since_last_chunk = 0
+                is_first_chunk = False
+
+    # ★変更: ループ後の残りバッファチェック
+    if not finished and buf_pos > 0:
+        if (semantic_id_buffer[:buf_pos] == im_end_tensor).any().item():
+            match_mask = (semantic_id_buffer[:buf_pos] == im_end_tensor)
+            first_match = match_mask.nonzero(as_tuple=False)[0, 0].item()
+            tokens_to_discard = buf_pos - first_match - 1
+            if tokens_to_discard > 0 and pending_tokens:
+                pending_tokens = pending_tokens[:-tokens_to_discard]
+
+        # Emit any remaining pending tokens after im_end trim
+        if pending_tokens:
             chunk_all = torch.cat(pending_tokens, dim=1)
             codes_new = chunk_all[1:, :].clone().clamp(min=0)
-
             if codes_new.shape[1] > 0:
-                t_dec = time.perf_counter()
                 audio_np = streaming_decoder.decode_chunk(codes_new)
-                t_dec_ms = (time.perf_counter() - t_dec) * 1000
-
                 if len(audio_np) > 0:
-                    chunk_duration = len(audio_np) / state.sample_rate
-                    logger.debug(
-                        f"Streaming decode: {codes_new.shape[1]} frames → "
-                        f"{chunk_duration:.2f}s audio in {t_dec_ms:.0f}ms"
-                    )
                     yield {"type": "codes", "codes": codes_new.cpu()}
                     yield {"type": "audio_chunk", "audio": audio_np}
 
-            pending_tokens = []
-            tokens_since_last_chunk = 0
-            is_first_chunk = False
-
+    # --- Stats and cleanup (変更なし、ただし cleanup に新変数追加) ---
     t_total = time.perf_counter() - t0
     yield {
         "type": "stats",
@@ -930,9 +990,9 @@ def _generate_streaming(
         "tok_per_sec": total_tokens / t_total if t_total > 0 else 0,
     }
 
-    # Cleanup — remove KV caches from codec to free VRAM
     streaming_decoder.reset()
-    del streaming_decoder, cur_token, all_new_tokens, pending_tokens
+    del streaming_decoder, fixed_cur_token, fixed_input_pos  # ★変更: 新変数の cleanup
+    del all_new_tokens, pending_tokens, semantic_id_buffer   # ★変更: 新変数の cleanup
 
 
 # ============================================================

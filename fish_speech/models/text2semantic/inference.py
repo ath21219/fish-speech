@@ -197,27 +197,61 @@ def decode_n_tokens(
     audio_parts: torch.Tensor,
     decode_one_token=decode_one_token_ar,
 ):
+    """
+    Optimized decode loop.
+    
+    [OPT-F19] Removed tqdm, moved sdpa_kernel outside loop,
+              replaced per-token GPU→CPU sync with batched check.
+    [OPT-B6]  Pre-allocated fixed-address buffers for input_pos and cur_token
+              to enable CUDA Graph capture by torch.compile(reduce-overhead).
+    """
+    codebook_dim = model.config.num_codebooks + 1
+
     # Rolling window for RAS (Repetition Aware Sampling)
     previous_tokens = torch.zeros(
-        (model.config.num_codebooks + 1, RAS_WIN_SIZE),
+        (codebook_dim, RAS_WIN_SIZE),
         dtype=torch.int,
         device=cur_token.device,
     )
-    # Accumulate all generated tokens (the actual output)
-    new_tokens = []
 
-    # [MODIFIED] Pre-fetch ID for efficiency loop
+    # [OPT-F19] Pre-fetch im_end_id once
     im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
 
-    # Pre-allocate RAS window write position counter
+    # [OPT-B6] Pre-allocate FIXED-ADDRESS buffers
+    # torch.compile + CUDA Graph requires tensor addresses to be stable.
+    # We use .copy_() to update values without changing the tensor object.
+    fixed_input_pos = torch.empty(1, dtype=torch.long, device=cur_token.device)
+    fixed_input_pos.copy_(input_pos)
+    fixed_cur_token = torch.empty(
+        1, codebook_dim, 1, dtype=cur_token.dtype, device=cur_token.device
+    )
+    fixed_cur_token.copy_(cur_token)
+
+    # [OPT-F19] Pre-allocate im_end tensor for GPU-side comparison
+    im_end_tensor = torch.tensor(im_end_id, dtype=torch.int, device=cur_token.device)
+
+    # Accumulate generated tokens
+    new_tokens = []
     ras_pos = 0
 
-    for i in tqdm(range(num_new_tokens)):
-        with sdpa_kernel(SDPBackend.MATH):
+    # [OPT-F19] Batch the im_end check: accumulate a few tokens' semantic IDs
+    # and check on GPU every CHECK_INTERVAL tokens, with one CPU sync.
+    CHECK_INTERVAL = 8  # Check for im_end every N tokens
+
+    # Buffer to store semantic token IDs for batched end-check
+    semantic_id_buffer = torch.empty(
+        CHECK_INTERVAL, dtype=torch.int, device=cur_token.device
+    )
+    buf_pos = 0
+    finished = False
+
+    # [OPT-F19] Move sdpa_kernel context OUTSIDE the loop
+    with sdpa_kernel(SDPBackend.MATH):
+        for i in range(num_new_tokens):
             next_token = decode_one_token(
                 model=model,
-                x=cur_token,
-                input_pos=input_pos,
+                x=fixed_cur_token,
+                input_pos=fixed_input_pos,
                 previous_tokens=previous_tokens,
                 temperature=temperature,
                 top_p=top_p,
@@ -227,19 +261,49 @@ def decode_n_tokens(
                 audio_parts=audio_parts,
             )
 
-        input_pos += 1
-        cur_token = next_token.view(1, model.config.num_codebooks + 1, -1)
-        # Circular buffer for RAS window (avoids roll which creates new tensors)
-        previous_tokens[:, ras_pos % RAS_WIN_SIZE] = next_token.view(
-            model.config.num_codebooks + 1, -1
-        )[:, 0]
-        ras_pos += 1
-        new_tokens.append(next_token)
+            # [OPT-B6] Update fixed buffers in-place (preserves tensor address)
+            fixed_input_pos.add_(1)
+            fixed_cur_token.copy_(
+                next_token.view(1, codebook_dim, 1)
+            )
 
-        if cur_token[0, 0, -1] == im_end_id:
-            break
+            # RAS circular buffer (in-place, no new tensors)
+            previous_tokens[:, ras_pos % RAS_WIN_SIZE] = next_token.view(
+                codebook_dim, -1
+            )[:, 0]
+            ras_pos += 1
+            new_tokens.append(next_token)
 
-    del cur_token
+            # [OPT-F19] Buffer the semantic token ID for batched im_end check
+            semantic_id_buffer[buf_pos] = next_token[0, 0]
+            buf_pos += 1
+
+            if buf_pos >= CHECK_INTERVAL:
+                # Batch check: any of the last CHECK_INTERVAL tokens == im_end?
+                # Single GPU→CPU transfer instead of CHECK_INTERVAL transfers
+                if (semantic_id_buffer[:buf_pos] == im_end_tensor).any().item():
+                    # Find exact position where im_end occurred
+                    # Trim new_tokens to the first im_end
+                    match_mask = (semantic_id_buffer[:buf_pos] == im_end_tensor)
+                    first_match = match_mask.nonzero(as_tuple=False)[0, 0].item()
+                    # Remove tokens after the im_end
+                    tokens_to_remove = buf_pos - first_match - 1
+                    if tokens_to_remove > 0:
+                        new_tokens = new_tokens[:-tokens_to_remove]
+                    finished = True
+                    break
+                buf_pos = 0
+
+        # [OPT-F19] Final check for remaining buffered tokens
+        if not finished and buf_pos > 0:
+            if (semantic_id_buffer[:buf_pos] == im_end_tensor).any().item():
+                match_mask = (semantic_id_buffer[:buf_pos] == im_end_tensor)
+                first_match = match_mask.nonzero(as_tuple=False)[0, 0].item()
+                tokens_to_remove = buf_pos - first_match - 1
+                if tokens_to_remove > 0:
+                    new_tokens = new_tokens[:-tokens_to_remove]
+
+    del fixed_cur_token, fixed_input_pos, semantic_id_buffer
 
     return torch.cat(new_tokens, dim=1)
 
@@ -373,7 +437,6 @@ def init_model(checkpoint_path, device, precision, compile=False):
 
     if isinstance(model, DualARTransformer):
         decode_one_token = decode_one_token_ar
-        # prefill_n_tokens = decode_one_token_ar
         logger.info("Using DualARTransformer")
     else:
         raise ValueError("Unsupported model type")
@@ -387,11 +450,25 @@ def init_model(checkpoint_path, device, precision, compile=False):
     model._cache_setup_done = False
 
     if compile:
-        logger.info("Compiling function...")
+        # [OPT-B7] Enable custom_op mode BEFORE compiling so that
+        # GGUFLinear uses torch.ops.gguf.* custom ops instead of
+        # branching Python code, which eliminates graph breaks.
+        try:
+            from fish_speech.gguf.dequant import enable_custom_op_mode
+            enable_custom_op_mode(model)
+            logger.info("Custom op mode enabled for torch.compile")
+        except Exception as e:
+            logger.warning(f"Could not enable custom_op mode: {e}")
+
+        logger.info("Compiling decode function...")
+        # [OPT-B6] Use mode="reduce-overhead" to enable CUDA Graph capture.
+        # Combined with fixed-address buffers in decode_n_tokens, this
+        # allows the entire decode step to be captured as a CUDA Graph,
+        # eliminating per-kernel CPU→GPU launch overhead.
         decode_one_token = torch.compile(
             decode_one_token,
             backend="inductor" if torch.cuda.is_available() else "aot_eager",
-            mode="default" if torch.cuda.is_available() else None,
+            mode="reduce-overhead" if torch.cuda.is_available() else None,
             fullgraph=True,
         )
 
