@@ -47,7 +47,8 @@ dependencies = [
     "cachetools",
     "descript-audio-codec",
     "descript-audiotools",
-    "safetensors"
+    "safetensors",
+    "gguf>=0.6.0"
 ]
 
 [project.optional-dependencies]

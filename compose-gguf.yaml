@@ -1,0 +1,46 @@
+services:
+  fish-speech-gguf:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile-gguf
+    container_name: fish-speech-gguf
+    restart: unless-stopped
+
+    ports:
+      - "7820:7820"
+
+    volumes:
+      - ./models/gguf:/app/models/gguf:ro
+      - ./checkpoints/s2-pro:/app/checkpoints/s2-pro:ro
+      - ./references:/app/references:rw
+
+    environment:
+      - GGUF_MODEL_PATH=/app/models/gguf/s2-pro-q6_k.gguf
+      - CODEC_PATH=/app/checkpoints/s2-pro/codec.pth
+      - API_HOST=0.0.0.0
+      - API_PORT=7820
+      - MAX_SEQ_LEN=2048
+      - MAX_TEXT_LENGTH=${MAX_TEXT_LENGTH:-0}
+      - API_KEY=${API_KEY:-}
+      - NVIDIA_VISIBLE_DEVICES=all
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7820/v1/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"

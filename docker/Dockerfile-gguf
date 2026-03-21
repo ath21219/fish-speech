@@ -1,0 +1,119 @@
+# docker/Dockerfile-gguf
+#
+# Fish Speech S2-Pro GGUF Inference Server
+#
+# Build:
+#   docker compose -f docker-compose.yaml build
+# Run:
+#   docker compose -f docker-compose.yaml up -d
+
+ARG CUDA_VER=13.0.0
+ARG UBUNTU_VER=24.04
+
+# ---------- Base ----------
+FROM nvidia/cuda:${CUDA_VER}-cudnn-devel-ubuntu${UBUNTU_VER} AS base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-dev python3-venv \
+    git curl ca-certificates \
+    libsndfile1 ffmpeg \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ---------- App ----------
+FROM base AS app
+
+ARG USERNAME=fish
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+RUN groupadd -g ${USER_GID} ${USERNAME} 2>/dev/null || true && \
+    useradd -m -u ${USER_UID} -g ${USER_GID} ${USERNAME} 2>/dev/null || true && \
+    mkdir -p /app && chown ${USER_UID}:${USER_GID} /app
+
+WORKDIR /app
+
+# Install PyTorch nightly + torchcodec (cu130)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install --no-cache-dir --pre \
+    torch torchaudio torchcodec \
+    --index-url https://download.pytorch.org/whl/nightly/cu130 && \
+    pip3 install --no-cache-dir triton
+
+# 2. App dependencies (medium churn)
+COPY requirements-gguf.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install --no-cache-dir -r requirements-gguf.txt
+
+# 3. Source code (high churn → COPY only)
+COPY --chown=${USER_UID}:${USER_GID} . .
+
+USER ${USER_UID}:${USER_GID}
+
+# ---------- Runtime ----------
+EXPOSE 7820
+
+ENV GGUF_MODEL_PATH=/app/models/gguf/s2-pro-q6_k.gguf \
+    CODEC_PATH=/app/checkpoints/s2-pro/codec.pth \
+    API_HOST=0.0.0.0 \
+    API_PORT=7820 \
+    MAX_SEQ_LEN=2048 \
+    MAX_TEXT_LENGTH=0
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:${API_PORT}/v1/health || exit 1
+
+# Generate entrypoint inline (docker/ excluded by .dockerignore)
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'set -euo pipefail' \
+    '' \
+    'log() { echo "[$(date +"%Y-%m-%d %H:%M:%S")] $*" >&2; }' \
+    '' \
+    'GGUF_MODEL_PATH="${GGUF_MODEL_PATH:-/app/models/gguf/s2-pro-q6_k.gguf}"' \
+    'CODEC_PATH="${CODEC_PATH:-/app/checkpoints/s2-pro/codec.pth}"' \
+    'API_HOST="${API_HOST:-0.0.0.0}"' \
+    'API_PORT="${API_PORT:-7820}"' \
+    'MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"' \
+    'MAX_TEXT_LENGTH="${MAX_TEXT_LENGTH:-0}"' \
+    '' \
+    'if [ ! -f "${GGUF_MODEL_PATH}" ]; then' \
+    '    log "ERROR: GGUF model not found at ${GGUF_MODEL_PATH}"' \
+    '    exit 1' \
+    'fi' \
+    '' \
+    'if [ ! -f "${CODEC_PATH}" ]; then' \
+    '    log "ERROR: Codec not found at ${CODEC_PATH}"' \
+    '    exit 1' \
+    'fi' \
+    '' \
+    'log "Fish Speech GGUF API Server"' \
+    'log "  Model:    ${GGUF_MODEL_PATH}"' \
+    'log "  Codec:    ${CODEC_PATH}"' \
+    'log "  Listen:   ${API_HOST}:${API_PORT}"' \
+    '' \
+    'CMD="python3 tools/api_server_gguf.py' \
+    '    --gguf-path ${GGUF_MODEL_PATH}' \
+    '    --codec-path ${CODEC_PATH}' \
+    '    --listen ${API_HOST}:${API_PORT}' \
+    '    --max-seq-len ${MAX_SEQ_LEN}"' \
+    '' \
+    'if [ "${MAX_TEXT_LENGTH}" -gt 0 ] 2>/dev/null; then' \
+    '    CMD="${CMD} --max-text-length ${MAX_TEXT_LENGTH}"' \
+    'fi' \
+    '' \
+    'if [ -n "${API_KEY:-}" ]; then' \
+    '    CMD="${CMD} --api-key ${API_KEY}"' \
+    'fi' \
+    '' \
+    'log "Executing: ${CMD}"' \
+    'exec ${CMD}' \
+    > /app/entrypoint-gguf.sh && chmod +x /app/entrypoint-gguf.sh
+
+ENTRYPOINT ["/app/entrypoint-gguf.sh"]

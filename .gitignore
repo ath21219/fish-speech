@@ -112,3 +112,8 @@ ffprobe.exe
 # ----------
 /*.test.sh
 asr-label*
+
+# Models
+# ----------
+/models
+/checkpoints
