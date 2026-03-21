@@ -885,21 +885,59 @@ def _generate_streaming(
     semantic_id_buffer = torch.empty(CHECK_INTERVAL, dtype=torch.int, device=device)
     buf_pos = 0
 
-    # [OPT-F19] sdpa_kernel context outside loop
-    with sdpa_kernel(SDPBackend.MATH):
-        while not finished and total_tokens < effective_max:
-            next_token = decode_one_token(
+    # [OPT-B6] Manual CUDA Graph capture for streaming decode
+    from fish_speech.models.text2semantic.inference import CUDAGraphRunner
+
+    use_cuda_graph = (device.type == "cuda" if isinstance(device, torch.device)
+                      else str(device).startswith("cuda"))
+    graph_runner = None
+    if use_cuda_graph:
+        try:
+            graph_runner = CUDAGraphRunner(
                 model=model,
-                x=fixed_cur_token,                         # ★変更: 固定バッファ使用
-                input_pos=fixed_input_pos,                 # ★変更: 固定バッファ使用
-                temperature=temperature_t,
-                top_p=top_p_t,
+                decode_fn=decode_one_token,
+                codebook_dim=codebook_dim,
+                device=torch.device(device) if isinstance(device, str) else device,
+                dtype=dtype,
+                vocab_size=model.config.vocab_size,
                 top_k=top_k,
                 semantic_logit_bias=semantic_logit_bias,
                 audio_masks=audio_masks,
                 audio_parts=audio_parts,
-                previous_tokens=previous_tokens,
             )
+            graph_runner.static_x.copy_(fixed_cur_token)
+            graph_runner.static_input_pos.copy_(fixed_input_pos)
+            graph_runner.static_temperature.copy_(temperature_t)
+            graph_runner.static_top_p.copy_(top_p_t)
+            graph_runner.warmup_and_capture()
+        except Exception as e:
+            logger.warning(f"[CUDA Graph] Streaming capture failed ({e}), using eager")
+            graph_runner = None
+
+    # [OPT-F19] sdpa_kernel context outside loop
+    with sdpa_kernel(SDPBackend.MATH):
+        while not finished and total_tokens < effective_max:
+            if graph_runner is not None and graph_runner.captured:
+                next_token = graph_runner.replay(
+                    x=fixed_cur_token,
+                    input_pos=fixed_input_pos,
+                    temperature=temperature_t,
+                    top_p=top_p_t,
+                    previous_tokens=previous_tokens,
+                )
+            else:
+                next_token = decode_one_token(
+                    model=model,
+                    x=fixed_cur_token,
+                    input_pos=fixed_input_pos,
+                    temperature=temperature_t,
+                    top_p=top_p_t,
+                    top_k=top_k,
+                    semantic_logit_bias=semantic_logit_bias,
+                    audio_masks=audio_masks,
+                    audio_parts=audio_parts,
+                    previous_tokens=previous_tokens,
+                )
 
             # [OPT-B6] In-place buffer updates (preserves tensor address)
             fixed_input_pos.add_(1)                        # ★変更: += 1 ではなく .add_(1)
@@ -980,6 +1018,10 @@ def _generate_streaming(
                 if len(audio_np) > 0:
                     yield {"type": "codes", "codes": codes_new.cpu()}
                     yield {"type": "audio_chunk", "audio": audio_np}
+
+    if graph_runner is not None:
+        del graph_runner.graph
+        del graph_runner
 
     # --- Stats and cleanup (変更なし、ただし cleanup に新変数追加) ---
     t_total = time.perf_counter() - t0

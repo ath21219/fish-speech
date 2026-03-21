@@ -33,6 +33,214 @@ if hasattr(torch._inductor.config, "fx_graph_cache"):
 
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+# ============================================================
+# [OPT-B6] Manual CUDA Graph capture for decode step
+# ============================================================
+
+class CUDAGraphRunner:
+    """
+    Wraps decode_one_token_ar in a manually captured CUDA Graph.
+    
+    Unlike torch.compile(mode="reduce-overhead"), manual capture via
+    torch.cuda.CUDAGraph does NOT check for mutated inputs — KV cache
+    in-place updates work correctly.
+    
+    Usage:
+        runner = CUDAGraphRunner(model, decode_fn, warmup_kwargs)
+        # In decode loop:
+        output = runner.replay(x, input_pos, temperature, top_p, ...)
+    """
+
+    def __init__(
+        self,
+        model,
+        decode_fn,
+        *,
+        codebook_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        vocab_size: int,
+        top_k: int = 30,
+        semantic_logit_bias: torch.Tensor,
+        audio_masks: torch.Tensor,
+        audio_parts: torch.Tensor,
+    ):
+        self.model = model
+        self.decode_fn = decode_fn
+        self.device = device
+        self.graph = torch.cuda.CUDAGraph()
+        self.captured = False
+
+        # --- Static input buffers (fixed addresses for capture/replay) ---
+        self.static_x = torch.zeros(
+            1, codebook_dim, 1, dtype=torch.long, device=device
+        )
+        self.static_input_pos = torch.zeros(1, dtype=torch.long, device=device)
+        self.static_temperature = torch.zeros(1, dtype=dtype, device=device)
+        self.static_top_p = torch.zeros(1, dtype=dtype, device=device)
+        self.static_previous_tokens = torch.zeros(
+            codebook_dim, RAS_WIN_SIZE, dtype=torch.int, device=device
+        )
+
+        # These don't change between calls but must have fixed addresses
+        self.static_semantic_logit_bias = semantic_logit_bias.clone()
+        self.static_audio_masks = audio_masks
+        self.static_audio_parts = audio_parts
+        self.top_k = top_k
+
+        # Static output buffer (will be filled during capture)
+        self.static_output = None
+
+    def _run_fn(self):
+        """The function to capture — calls decode_one_token_ar with static buffers."""
+        return self.decode_fn(
+            model=self.model,
+            x=self.static_x,
+            input_pos=self.static_input_pos,
+            temperature=self.static_temperature,
+            top_p=self.static_top_p,
+            top_k=self.top_k,
+            semantic_logit_bias=self.static_semantic_logit_bias,
+            audio_masks=self.static_audio_masks,
+            audio_parts=self.static_audio_parts,
+            previous_tokens=self.static_previous_tokens,
+        )
+
+    def warmup_and_capture(self):
+        """
+        Warmup the function (JIT Triton kernels etc.) then capture as CUDA Graph.
+        Must be called AFTER model.setup_caches() and AFTER prefill.
+        """
+        logger.info("[CUDA Graph] Pre-materializing CPU tensors on GPU...")
+
+        # ── Phase 0: Ensure ALL model tensors are on GPU ──
+        # Some tensors (e.g. GGUFEmbedding buffers, bias, freqs_cis) may
+        # still be on CPU after GGUF loading. CUDA Graph capture forbids
+        # any CPU↔GPU copy, so we must move them now.
+        model = self.model
+        device = self.device
+
+        moved = 0
+        for name, param in model.named_parameters():
+            if not param.is_cuda:
+                # Can't reassign parameters easily, but we can move data
+                param.data = param.data.to(device, non_blocking=True)
+                moved += 1
+        for name, buf in model.named_buffers():
+            if not buf.is_cuda:
+                # Re-register buffer on GPU
+                parts = name.split('.')
+                mod = model
+                for p in parts[:-1]:
+                    mod = getattr(mod, p)
+                mod.register_buffer(parts[-1], buf.to(device, non_blocking=True),
+                                    persistent=False)
+                moved += 1
+
+        # Also handle GGUFLinear bias tensors and GGUFEmbedding internals
+        for name, module in model.named_modules():
+            if hasattr(module, 'bias') and module.bias is not None:
+                if isinstance(module.bias, torch.Tensor) and not module.bias.is_cuda:
+                    module.bias = module.bias.to(device, non_blocking=True)
+                    moved += 1
+            # GGUFParameter.data should already be on GPU, but double-check
+            if hasattr(module, 'qparam') and hasattr(module.qparam, 'data'):
+                if isinstance(module.qparam.data, torch.Tensor) and not module.qparam.data.is_cuda:
+                    module.qparam.data = module.qparam.data.to(device, non_blocking=True)
+                    moved += 1
+
+        if moved > 0:
+            torch.cuda.synchronize(device)
+            logger.info(f"[CUDA Graph] Moved {moved} CPU tensors to GPU")
+
+        # ── Phase 0b: Pre-cache dequantized embedding weights ──
+        # GGUFEmbedding.forward() calls dequantize() every time, which
+        # may create intermediate CPU tensors. We pre-cache the result.
+        for name, module in model.named_modules():
+            if hasattr(module, '__class__') and module.__class__.__name__ == 'GGUFEmbedding':
+                # Pre-dequantize and store as a regular tensor
+                with torch.no_grad():
+                    w = module.qparam.dequantize(dtype=torch.float16).to(device)
+                    module._cached_embed_weight = w
+                    # Monkey-patch forward to use cached weight
+                    original_forward = module.forward
+                    def make_cached_forward(m, cached_w):
+                        def cached_forward(x):
+                            return F.embedding(x, cached_w)
+                        return cached_forward
+                    module.forward = make_cached_forward(module, w)
+                    moved += 1
+                    logger.debug(f"[CUDA Graph] Cached embedding: {name}")
+
+            # Also cache the .weight property for tie_word_embeddings
+            if hasattr(module, '__class__') and module.__class__.__name__ == 'GGUFEmbedding':
+                if hasattr(module, 'qparam'):
+                    w_cached = module.qparam.dequantize(dtype=torch.float16).to(device)
+                    module._weight_cache = w_cached
+                    # Override the weight property
+                    original_class = module.__class__
+                    if not hasattr(original_class, '_weight_patched'):
+                        @property
+                        def weight_prop(self):
+                            if hasattr(self, '_weight_cache') and self._weight_cache is not None:
+                                return self._weight_cache
+                            return self.qparam.dequantize(dtype=torch.float16)
+                        original_class.weight = weight_prop
+                        original_class._weight_patched = True
+
+        # ── Phase 1: Warmup on side stream ──
+        logger.info("[CUDA Graph] Warming up decode function...")
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                _ = self._run_fn()
+        torch.cuda.current_stream().wait_stream(s)
+
+        # Debug: detect any hidden CPU-GPU syncs
+        torch.cuda.set_sync_debug_mode(2)  # Error on any sync
+
+        # ── Phase 2: Capture ──
+        logger.info("[CUDA Graph] Capturing graph...")
+        try:
+            with torch.cuda.graph(self.graph):
+                self.static_output = self._run_fn()
+        except RuntimeError as e:
+            import traceback
+            logger.error(f"[CUDA Graph] Capture error: {e}")
+            logger.error(f"[CUDA Graph] Traceback:\n{traceback.format_exc()}")
+            raise
+
+        self.captured = True
+        logger.info("[CUDA Graph] Capture complete.")
+
+        torch.cuda.set_sync_debug_mode(0)  # Reset
+
+    def replay(
+        self,
+        x: torch.Tensor,
+        input_pos: torch.Tensor,
+        temperature: torch.Tensor,
+        top_p: torch.Tensor,
+        previous_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Copy inputs into static buffers and replay the captured graph.
+        Returns a CLONE of the output (static_output address is reused).
+        """
+        # Copy new values into static buffers (preserves addresses)
+        self.static_x.copy_(x)
+        self.static_input_pos.copy_(input_pos)
+        self.static_temperature.copy_(temperature)
+        self.static_top_p.copy_(top_p)
+        self.static_previous_tokens.copy_(previous_tokens)
+
+        # Replay
+        self.graph.replay()
+
+        # MUST clone — static_output memory will be overwritten on next replay
+        return self.static_output.clone()
+
 from fish_speech.models.text2semantic.llama import (
     BaseTransformer,
     DualARTransformer,
@@ -198,95 +406,110 @@ def decode_n_tokens(
     decode_one_token=decode_one_token_ar,
 ):
     """
-    Optimized decode loop.
-    
-    [OPT-F19] Removed tqdm, moved sdpa_kernel outside loop,
-              replaced per-token GPU→CPU sync with batched check.
-    [OPT-B6]  Pre-allocated fixed-address buffers for input_pos and cur_token
-              to enable CUDA Graph capture by torch.compile(reduce-overhead).
+    Optimized decode loop with manual CUDA Graph capture.
+
+    [OPT-B6]  Manual CUDA Graph via torch.cuda.CUDAGraph (not torch.compile).
+              Unlike torch.compile's reduce-overhead mode, manual capture allows
+              KV cache in-place updates without graph breaks.
+    [OPT-F19] No tqdm, sdpa_kernel outside loop, batched im_end check.
     """
     codebook_dim = model.config.num_codebooks + 1
+    device = cur_token.device
 
-    # Rolling window for RAS (Repetition Aware Sampling)
+    # Rolling window for RAS
     previous_tokens = torch.zeros(
-        (codebook_dim, RAS_WIN_SIZE),
-        dtype=torch.int,
-        device=cur_token.device,
+        (codebook_dim, RAS_WIN_SIZE), dtype=torch.int, device=device,
     )
 
-    # [OPT-F19] Pre-fetch im_end_id once
     im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
+    im_end_tensor = torch.tensor(im_end_id, dtype=torch.int, device=device)
 
-    # [OPT-B6] Pre-allocate FIXED-ADDRESS buffers
-    # torch.compile + CUDA Graph requires tensor addresses to be stable.
-    # We use .copy_() to update values without changing the tensor object.
-    fixed_input_pos = torch.empty(1, dtype=torch.long, device=cur_token.device)
-    fixed_input_pos.copy_(input_pos)
-    fixed_cur_token = torch.empty(
-        1, codebook_dim, 1, dtype=cur_token.dtype, device=cur_token.device
-    )
-    fixed_cur_token.copy_(cur_token)
+    # ── [OPT-B6] Build CUDA Graph runner ──────────────────────
+    use_cuda_graph = (device.type == "cuda" if isinstance(device, torch.device)
+                      else str(device).startswith("cuda"))
 
-    # [OPT-F19] Pre-allocate im_end tensor for GPU-side comparison
-    im_end_tensor = torch.tensor(im_end_id, dtype=torch.int, device=cur_token.device)
-
-    # Accumulate generated tokens
-    new_tokens = []
-    ras_pos = 0
-
-    # [OPT-F19] Batch the im_end check: accumulate a few tokens' semantic IDs
-    # and check on GPU every CHECK_INTERVAL tokens, with one CPU sync.
-    CHECK_INTERVAL = 8  # Check for im_end every N tokens
-
-    # Buffer to store semantic token IDs for batched end-check
-    semantic_id_buffer = torch.empty(
-        CHECK_INTERVAL, dtype=torch.int, device=cur_token.device
-    )
-    buf_pos = 0
-    finished = False
-
-    # [OPT-F19] Move sdpa_kernel context OUTSIDE the loop
-    with sdpa_kernel(SDPBackend.MATH):
-        for i in range(num_new_tokens):
-            next_token = decode_one_token(
+    graph_runner = None
+    if use_cuda_graph:
+        try:
+            graph_runner = CUDAGraphRunner(
                 model=model,
-                x=fixed_cur_token,
-                input_pos=fixed_input_pos,
-                previous_tokens=previous_tokens,
-                temperature=temperature,
-                top_p=top_p,
+                decode_fn=decode_one_token,
+                codebook_dim=codebook_dim,
+                device=torch.device(device),
+                dtype=next(model.parameters()).dtype,
+                vocab_size=model.config.vocab_size,
                 top_k=top_k,
                 semantic_logit_bias=semantic_logit_bias,
                 audio_masks=audio_masks,
                 audio_parts=audio_parts,
             )
+            # Feed initial token for warmup
+            graph_runner.static_x.copy_(cur_token.view(1, codebook_dim, 1))
+            graph_runner.static_input_pos.copy_(input_pos)
+            graph_runner.static_temperature.copy_(temperature)
+            graph_runner.static_top_p.copy_(top_p)
+            graph_runner.warmup_and_capture()
+        except Exception as e:
+            logger.warning(f"[CUDA Graph] Capture failed ({e}), falling back to eager")
+            graph_runner = None
 
-            # [OPT-B6] Update fixed buffers in-place (preserves tensor address)
+    # ── Fixed-address buffers (fallback path uses these) ──────
+    fixed_input_pos = torch.empty(1, dtype=torch.long, device=device)
+    fixed_input_pos.copy_(input_pos)
+    fixed_cur_token = cur_token.view(1, codebook_dim, 1).clone()
+
+    new_tokens = []
+    ras_pos = 0
+    CHECK_INTERVAL = 8
+    semantic_id_buffer = torch.empty(CHECK_INTERVAL, dtype=torch.int, device=device)
+    buf_pos = 0
+    finished = False
+
+    with sdpa_kernel(SDPBackend.MATH):
+        for i in range(num_new_tokens):
+            if graph_runner is not None and graph_runner.captured:
+                # ── CUDA Graph replay path ──
+                next_token = graph_runner.replay(
+                    x=fixed_cur_token,
+                    input_pos=fixed_input_pos,
+                    temperature=temperature,
+                    top_p=top_p,
+                    previous_tokens=previous_tokens,
+                )
+            else:
+                # ── Eager fallback path ──
+                next_token = decode_one_token(
+                    model=model,
+                    x=fixed_cur_token,
+                    input_pos=fixed_input_pos,
+                    previous_tokens=previous_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    semantic_logit_bias=semantic_logit_bias,
+                    audio_masks=audio_masks,
+                    audio_parts=audio_parts,
+                )
+
+            # Update fixed buffers in-place
             fixed_input_pos.add_(1)
-            fixed_cur_token.copy_(
-                next_token.view(1, codebook_dim, 1)
-            )
+            fixed_cur_token.copy_(next_token.view(1, codebook_dim, 1))
 
-            # RAS circular buffer (in-place, no new tensors)
+            # RAS circular buffer
             previous_tokens[:, ras_pos % RAS_WIN_SIZE] = next_token.view(
                 codebook_dim, -1
             )[:, 0]
             ras_pos += 1
             new_tokens.append(next_token)
 
-            # [OPT-F19] Buffer the semantic token ID for batched im_end check
+            # Batched im_end check
             semantic_id_buffer[buf_pos] = next_token[0, 0]
             buf_pos += 1
 
             if buf_pos >= CHECK_INTERVAL:
-                # Batch check: any of the last CHECK_INTERVAL tokens == im_end?
-                # Single GPU→CPU transfer instead of CHECK_INTERVAL transfers
                 if (semantic_id_buffer[:buf_pos] == im_end_tensor).any().item():
-                    # Find exact position where im_end occurred
-                    # Trim new_tokens to the first im_end
-                    match_mask = (semantic_id_buffer[:buf_pos] == im_end_tensor)
+                    match_mask = semantic_id_buffer[:buf_pos] == im_end_tensor
                     first_match = match_mask.nonzero(as_tuple=False)[0, 0].item()
-                    # Remove tokens after the im_end
                     tokens_to_remove = buf_pos - first_match - 1
                     if tokens_to_remove > 0:
                         new_tokens = new_tokens[:-tokens_to_remove]
@@ -294,15 +517,18 @@ def decode_n_tokens(
                     break
                 buf_pos = 0
 
-        # [OPT-F19] Final check for remaining buffered tokens
         if not finished and buf_pos > 0:
             if (semantic_id_buffer[:buf_pos] == im_end_tensor).any().item():
-                match_mask = (semantic_id_buffer[:buf_pos] == im_end_tensor)
+                match_mask = semantic_id_buffer[:buf_pos] == im_end_tensor
                 first_match = match_mask.nonzero(as_tuple=False)[0, 0].item()
                 tokens_to_remove = buf_pos - first_match - 1
                 if tokens_to_remove > 0:
                     new_tokens = new_tokens[:-tokens_to_remove]
 
+    # Cleanup
+    if graph_runner is not None:
+        del graph_runner.graph
+        del graph_runner
     del fixed_cur_token, fixed_input_pos, semantic_id_buffer
 
     return torch.cat(new_tokens, dim=1)
@@ -450,27 +676,18 @@ def init_model(checkpoint_path, device, precision, compile=False):
     model._cache_setup_done = False
 
     if compile:
-        # [OPT-B7] Enable custom_op mode BEFORE compiling so that
-        # GGUFLinear uses torch.ops.gguf.* custom ops instead of
-        # branching Python code, which eliminates graph breaks.
+        # [OPT-B6] Manual CUDA Graph capture is now handled inside
+        # decode_n_tokens(), so torch.compile is no longer needed.
+        # We still enable custom_op mode for potential future use.
         try:
             from fish_speech.gguf.dequant import enable_custom_op_mode
             enable_custom_op_mode(model)
-            logger.info("Custom op mode enabled for torch.compile")
+            logger.info("Custom op mode enabled")
         except Exception as e:
             logger.warning(f"Could not enable custom_op mode: {e}")
 
-        logger.info("Compiling decode function...")
-        # [OPT-B6] Use mode="reduce-overhead" to enable CUDA Graph capture.
-        # Combined with fixed-address buffers in decode_n_tokens, this
-        # allows the entire decode step to be captured as a CUDA Graph,
-        # eliminating per-kernel CPU→GPU launch overhead.
-        decode_one_token = torch.compile(
-            decode_one_token,
-            backend="inductor" if torch.cuda.is_available() else "aot_eager",
-            mode="reduce-overhead" if torch.cuda.is_available() else None,
-            fullgraph=True,
-        )
+        logger.info("CUDA Graph will be captured at first decode call (manual capture)")
+        # decode_one_token remains the raw function — no torch.compile wrapper
 
     return model.eval(), decode_one_token
 
