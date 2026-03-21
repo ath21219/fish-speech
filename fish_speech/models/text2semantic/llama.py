@@ -871,7 +871,15 @@ class Attention(nn.Module):
         self.attention_qk_norm = config.attention_qk_norm
         self.config = config
 
+        # ★ CUDA Graph 対応: キャプチャ中に torch.tensor() は使えないため事前確保
+        self.register_buffer(
+            "_neg_inf",
+            torch.tensor(float("-inf")),
+            persistent=False,
+        )
+
         self._register_load_state_dict_pre_hook(self.load_hook)
+
 
     def load_hook(self, state_dict, prefix, *args):
         if prefix + "wq.weight" in state_dict:
@@ -961,8 +969,11 @@ class Attention(nn.Module):
 
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
+                # ★ CUDA Graph 対応: __init__ で事前確保した _neg_inf を使用
                 attn_bias = torch.where(
-                    attn_mask.logical_not(), float("-inf"), attn_bias
+                    attn_mask.logical_not(),
+                    self._neg_inf.to(dtype=query.dtype),
+                    attn_bias,
                 )
             else:
                 attn_bias = attn_bias + attn_mask

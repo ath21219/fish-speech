@@ -459,6 +459,9 @@ class GGUFEmbedding(nn.Module):
     @property
     def weight(self):
         """For compatibility with F.linear(x, embeddings.weight) in tie_word_embeddings."""
+        # ★ CUDA Graph キャプチャ用: 事前キャッシュがあればそれを返す
+        if hasattr(self, '_weight_override') and self._weight_override is not None:
+            return self._weight_override
         return self.qparam.dequantize(dtype=torch.float16)
 
     def extra_repr(self) -> str:

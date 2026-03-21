@@ -156,37 +156,27 @@ class CUDAGraphRunner:
         # ── Phase 0b: Pre-cache dequantized embedding weights ──
         # GGUFEmbedding.forward() calls dequantize() every time, which
         # may create intermediate CPU tensors. We pre-cache the result.
+        import torch.nn.functional as _F  # ★ CUDA Graph 用ローカル import
+
         for name, module in model.named_modules():
             if hasattr(module, '__class__') and module.__class__.__name__ == 'GGUFEmbedding':
-                # Pre-dequantize and store as a regular tensor
                 with torch.no_grad():
-                    w = module.qparam.dequantize(dtype=torch.float16).to(device)
-                    module._cached_embed_weight = w
-                    # Monkey-patch forward to use cached weight
-                    original_forward = module.forward
-                    def make_cached_forward(m, cached_w):
-                        def cached_forward(x):
-                            return F.embedding(x, cached_w)
-                        return cached_forward
-                    module.forward = make_cached_forward(module, w)
-                    moved += 1
-                    logger.debug(f"[CUDA Graph] Cached embedding: {name}")
+                    cached_w = module.qparam.dequantize(dtype=torch.float16).to(device)
 
-            # Also cache the .weight property for tie_word_embeddings
-            if hasattr(module, '__class__') and module.__class__.__name__ == 'GGUFEmbedding':
-                if hasattr(module, 'qparam'):
-                    w_cached = module.qparam.dequantize(dtype=torch.float16).to(device)
-                    module._weight_cache = w_cached
-                    # Override the weight property
-                    original_class = module.__class__
-                    if not hasattr(original_class, '_weight_patched'):
-                        @property
-                        def weight_prop(self):
-                            if hasattr(self, '_weight_cache') and self._weight_cache is not None:
-                                return self._weight_cache
-                            return self.qparam.dequantize(dtype=torch.float16)
-                        original_class.weight = weight_prop
-                        original_class._weight_patched = True
+                # forward を差し替え
+                def _make_forward(w):
+                    def _forward(x):
+                        return _F.embedding(x, w)
+                    return _forward
+                module.forward = _make_forward(cached_w)
+
+                # weight プロパティ用キャッシュ（tie_word_embeddings 対応）
+                module._weight_override = cached_w
+
+                moved += 1
+                logger.debug(f"[CUDA Graph] Cached GGUFEmbedding: {name} "
+                             f"({cached_w.shape}, {cached_w.nbytes/1e6:.1f} MB)")
+
 
         # ── Phase 1: Warmup on side stream ──
         logger.info("[CUDA Graph] Warming up decode function...")
@@ -200,21 +190,29 @@ class CUDAGraphRunner:
         # Debug: detect any hidden CPU-GPU syncs
         torch.cuda.set_sync_debug_mode(2)  # Error on any sync
 
+        # ★ RNG 状態を CUDA Graph に登録
+        # これにより replay ごとに RNG が正しく進行し、
+        # 毎回異なる乱数が生成される（サンプリングの多様性を維持）
+        device_idx = device.index if device.index is not None else 0
+        self.graph.register_generator_state(
+            torch.cuda.default_generators[device_idx]
+        )
+
         # ── Phase 2: Capture ──
         logger.info("[CUDA Graph] Capturing graph...")
         try:
+            torch.cuda.set_sync_debug_mode(2)
             with torch.cuda.graph(self.graph):
                 self.static_output = self._run_fn()
+            self.captured = True
+            logger.info("[CUDA Graph] Capture complete.")
         except RuntimeError as e:
             import traceback
             logger.error(f"[CUDA Graph] Capture error: {e}")
             logger.error(f"[CUDA Graph] Traceback:\n{traceback.format_exc()}")
-            raise
-
-        self.captured = True
-        logger.info("[CUDA Graph] Capture complete.")
-
-        torch.cuda.set_sync_debug_mode(0)  # Reset
+            self.captured = False
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
 
     def replay(
         self,
@@ -263,22 +261,28 @@ def logits_to_probs(
     logits,
     temperature: torch.Tensor,
     top_p: torch.Tensor,
-    top_k: int,  # 注意: 我看到你传进来的是 int，这很关键
+    top_k: int,
+    neg_inf: torch.Tensor = None,  # ★ 追加: GPU上の -inf 定数
 ) -> torch.Tensor:
+    if neg_inf is None:
+        # eager パスでのみ到達。CUDA Graph パスでは bufs['neg_inf'] が渡される
+        neg_inf = logits.new_tensor(float("-inf"))
+
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
     cum_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
 
     indices = torch.arange(sorted_logits.shape[-1], device=sorted_logits.device)
     top_k_mask = indices >= top_k
     sorted_indices_to_remove = (cum_probs > top_p) | top_k_mask
-    sorted_indices_to_remove[0] = False  # 单元素修改问题不大，或者写成 | (indices != 0)
+    # ★ 修正: Python bool 代入 → テンソル演算
+    first_mask = (indices == 0)
+    sorted_indices_to_remove = sorted_indices_to_remove & ~first_mask
 
     indices_to_remove = sorted_indices_to_remove.scatter(
         dim=-1, index=sorted_indices, src=sorted_indices_to_remove
     )
-    logits = torch.where(
-        indices_to_remove, float("-Inf"), logits
-    )  # 同样替换 masked_fill_ 为 torch.where
+    # ★ 修正: float("-Inf") リテラル → GPU テンソル neg_inf
+    logits = torch.where(indices_to_remove, neg_inf, logits)
     logits = logits / torch.clip(temperature, min=1e-5)
 
     probs = torch.nn.functional.softmax(logits, dim=-1)
@@ -290,12 +294,14 @@ def sample(
     temperature: torch.Tensor,
     top_p: torch.Tensor,
     top_k: int,
+    neg_inf: torch.Tensor = None,  # ★ 追加
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     probs = logits_to_probs(
         logits=logits[0, -1],
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        neg_inf=neg_inf,  # ★ 追加
     )
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
@@ -312,7 +318,9 @@ def _ensure_decode_buffers(model, device, dtype):
             torch.tensor([i], device=device, dtype=torch.long)
             for i in range(model.config.num_codebooks)
         ],
+        'neg_inf': torch.tensor(float("-inf"), device=device, dtype=dtype),  # ★ 追加
     }
+
 
 
 def decode_one_token_ar(
@@ -345,12 +353,14 @@ def decode_one_token_ar(
 
     # Normal sample
     main_token_normal = sample(
-        biased_logits, temperature=temperature, top_p=top_p, top_k=top_k
+        biased_logits, temperature=temperature, top_p=top_p, top_k=top_k,
+        neg_inf=bufs['neg_inf']  # ★ 追加
     )[0]
 
     # RAS: also sample with high temp to use as fallback if token repeats
     main_token_high = sample(
-        biased_logits, temperature=bufs['high_temp'], top_p=bufs['high_top_p'], top_k=top_k
+        biased_logits, temperature=bufs['high_temp'], top_p=bufs['high_top_p'], top_k=top_k,
+        neg_inf=bufs['neg_inf']  # ★ 追加
     )[0]
 
     # Use high-temp sample if: token is semantic AND token is in previous window
@@ -384,6 +394,7 @@ def decode_one_token_ar(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            neg_inf=bufs['neg_inf'],  # ★ 追加
         )[0]
 
         hidden_states = model.fast_embeddings(a)
