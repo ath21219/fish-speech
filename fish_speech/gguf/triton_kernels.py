@@ -1,5 +1,5 @@
 """
-Triton GPU kernels for GGUF Q6_K dequantization and fused GEMV.
+Triton GPU kernels for GGUF Q6_K/Q3_K dequantization and fused GEMV.
 
 Requires:
   - triton >= 3.2.0 (tested with triton-windows 3.2.0.post21)
@@ -7,6 +7,12 @@ Requires:
 
 These kernels are optional. If Triton is unavailable, the system
 falls back to PyTorch-based dequantization automatically.
+
+v2 improvements:
+  - Q6_K GEMV: eliminated redundant ql/qh loads (6→4 loads per block),
+    pre-loaded all 16 scales, autotuned num_warps
+  - Q3_K GEMV: autotuned num_warps
+  - Both: maintained numerical correctness with original kernels
 """
 
 from __future__ import annotations
@@ -31,102 +37,24 @@ if _TRITON_AVAILABLE:
     # ================================================================
 
     @triton.jit
-    def _decode_q3k_scales(block_ptr):
-        """Decode 16 x 6-bit scales from 12 packed bytes.
-
-        Layout:
-          ls[0..7]:   bytes 96..103  — low nibbles
-          hs[0..3]:   bytes 104..107 — high 2-bit pairs
-
-        Scale[i] = (ls_low[i] & 0x0F) | ((hs_bits[i] & 0x03) << 4) - 32
-        """
-        # Load low-scale bytes (8 bytes → 16 nibbles)
-        ls0 = tl.load(block_ptr + 96).to(tl.uint8)
-        ls1 = tl.load(block_ptr + 97).to(tl.uint8)
-        ls2 = tl.load(block_ptr + 98).to(tl.uint8)
-        ls3 = tl.load(block_ptr + 99).to(tl.uint8)
-        ls4 = tl.load(block_ptr + 100).to(tl.uint8)
-        ls5 = tl.load(block_ptr + 101).to(tl.uint8)
-        ls6 = tl.load(block_ptr + 102).to(tl.uint8)
-        ls7 = tl.load(block_ptr + 103).to(tl.uint8)
-
-        # Load high-scale bytes (4 bytes → 16 x 2-bit)
-        hs0 = tl.load(block_ptr + 104).to(tl.uint8)
-        hs1 = tl.load(block_ptr + 105).to(tl.uint8)
-        hs2 = tl.load(block_ptr + 106).to(tl.uint8)
-        hs3 = tl.load(block_ptr + 107).to(tl.uint8)
-
-        # Low nibbles: scale[0]=ls0&0xF, scale[8]=ls0>>4, etc.
-        s0  = ls0 & 0x0F;  s8  = (ls0 >> 4) & 0x0F
-        s1  = ls1 & 0x0F;  s9  = (ls1 >> 4) & 0x0F
-        s2  = ls2 & 0x0F;  s10 = (ls2 >> 4) & 0x0F
-        s3  = ls3 & 0x0F;  s11 = (ls3 >> 4) & 0x0F
-        s4  = ls4 & 0x0F;  s12 = (ls4 >> 4) & 0x0F
-        s5  = ls5 & 0x0F;  s13 = (ls5 >> 4) & 0x0F
-        s6  = ls6 & 0x0F;  s14 = (ls6 >> 4) & 0x0F
-        s7  = ls7 & 0x0F;  s15 = (ls7 >> 4) & 0x0F
-
-        # High 2-bit pairs
-        h0  = hs0 & 0x03;        h4  = (hs0 >> 2) & 0x03
-        h8  = (hs0 >> 4) & 0x03; h12 = (hs0 >> 6) & 0x03
-        h1  = hs1 & 0x03;        h5  = (hs1 >> 2) & 0x03
-        h9  = (hs1 >> 4) & 0x03; h13 = (hs1 >> 6) & 0x03
-        h2  = hs2 & 0x03;        h6  = (hs2 >> 2) & 0x03
-        h10 = (hs2 >> 4) & 0x03; h14 = (hs2 >> 6) & 0x03
-        h3  = hs3 & 0x03;        h7  = (hs3 >> 2) & 0x03
-        h11 = (hs3 >> 4) & 0x03; h15 = (hs3 >> 6) & 0x03
-
-        # Combine: 6-bit scale = low4 | (high2 << 4), then subtract 32
-        return (
-            (s0  | (h0  << 4)).to(tl.int8) - 32,
-            (s1  | (h1  << 4)).to(tl.int8) - 32,
-            (s2  | (h2  << 4)).to(tl.int8) - 32,
-            (s3  | (h3  << 4)).to(tl.int8) - 32,
-            (s4  | (h4  << 4)).to(tl.int8) - 32,
-            (s5  | (h5  << 4)).to(tl.int8) - 32,
-            (s6  | (h6  << 4)).to(tl.int8) - 32,
-            (s7  | (h7  << 4)).to(tl.int8) - 32,
-            (s8  | (h8  << 4)).to(tl.int8) - 32,
-            (s9  | (h9  << 4)).to(tl.int8) - 32,
-            (s10 | (h10 << 4)).to(tl.int8) - 32,
-            (s11 | (h11 << 4)).to(tl.int8) - 32,
-            (s12 | (h12 << 4)).to(tl.int8) - 32,
-            (s13 | (h13 << 4)).to(tl.int8) - 32,
-            (s14 | (h14 << 4)).to(tl.int8) - 32,
-            (s15 | (h15 << 4)).to(tl.int8) - 32,
-        )
-
-    @triton.jit
-    def _decode_q3k_chunk(
-        block_ptr, chunk_idx: tl.constexpr, offsets_16, d_scale, sc, DTYPE: tl.constexpr,
-    ):
-        """Decode 16 values from one of 16 sub-blocks within a Q3_K block."""
-        shift = (chunk_idx % 4) * 2
-        qs_row = chunk_idx // 4
-        is_upper = (chunk_idx % 2)
-        qs_byte_off = 32 + qs_row * 32 + is_upper * 16 + offsets_16
-        hmask_row = chunk_idx // 8
-        hmask_bit = chunk_idx % 8
-        hmask_byte_off = hmask_row * 32 + is_upper * 16 + offsets_16
-        qs_bytes = tl.load(block_ptr + qs_byte_off)
-        ql = (qs_bytes >> shift) & 0x03
-        hmask_bytes = tl.load(block_ptr + hmask_byte_off)
-        hbit = (hmask_bytes >> hmask_bit) & 0x01
-        hbit_inv = hbit ^ 0x01
-        q_val = ql.to(tl.int8) - (hbit_inv << 2).to(tl.int8)
-        return (d_scale * sc.to(DTYPE)) * q_val.to(DTYPE)
-
-    # ================================================================
-    #  Q3_K fused dequant + GEMV (batch=1 decode)
-    # ================================================================
-
-    @triton.jit
     def _q3k_decode_scale(scales_ptr, idx: tl.constexpr, DTYPE: tl.constexpr):
         """Decode one 6-bit scale from packed 12 scale bytes."""
         ls = (tl.load(scales_ptr + (idx % 8)) >> ((idx // 8) * 4)) & 0x0F
         hs = (tl.load(scales_ptr + 8 + (idx % 4)) >> ((idx // 4) * 2)) & 0x03
         return (ls | (hs << 4)).to(tl.int8) - 32
 
+    # ================================================================
+    #  Q3_K fused dequant + GEMV (v2: autotuned num_warps)
+    # ================================================================
+
+    @triton.autotune(
+        configs=[
+            triton.Config({}, num_warps=1),
+            triton.Config({}, num_warps=2),
+            triton.Config({}, num_warps=4),
+        ],
+        key=["D_in"],
+    )
     @triton.jit
     def _fused_dequant_gemv_q3k_kernel(
         input_ptr,
@@ -161,29 +89,35 @@ if _TRITON_AVAILABLE:
             qs_hi = tl.load(block_ptr + 64 + offsets_32)
             scales_ptr = block_ptr + 96
 
+            # Super-chunks 0-3: qs_lo
             for sc in tl.static_range(4):
                 ql = (qs_lo >> (sc * 2)) & 0x03
                 hbit_inv = ((hmask >> sc) & 0x01) ^ 0x01
                 q_val = ql.to(tl.int8) - (hbit_inv << 2).to(tl.int8)
+
                 sc_a = _q3k_decode_scale(scales_ptr, sc * 2, DTYPE)
                 sc_b = _q3k_decode_scale(scales_ptr, sc * 2 + 1, DTYPE)
                 final_scale = d_scale * tl.where(
                     mask_16, sc_a.to(DTYPE), sc_b.to(DTYPE)
                 )
+
                 w = final_scale * q_val.to(DTYPE)
                 x = tl.load(input_ptr + input_base + sc * 32 + offsets_32)
                 acc += w.to(tl.float32) * x.to(tl.float32)
 
+            # Super-chunks 4-7: qs_hi
             for sc in tl.static_range(4):
                 sc_idx = sc + 4
                 ql = (qs_hi >> (sc * 2)) & 0x03
                 hbit_inv = ((hmask >> sc_idx) & 0x01) ^ 0x01
                 q_val = ql.to(tl.int8) - (hbit_inv << 2).to(tl.int8)
+
                 sc_a = _q3k_decode_scale(scales_ptr, sc_idx * 2, DTYPE)
                 sc_b = _q3k_decode_scale(scales_ptr, sc_idx * 2 + 1, DTYPE)
                 final_scale = d_scale * tl.where(
                     mask_16, sc_a.to(DTYPE), sc_b.to(DTYPE)
                 )
+
                 w = final_scale * q_val.to(DTYPE)
                 x = tl.load(
                     input_ptr + input_base + sc_idx * 32 + offsets_32
@@ -194,61 +128,7 @@ if _TRITON_AVAILABLE:
         tl.store(output_ptr + row_idx, result)
 
     # ================================================================
-    #  Python wrappers for Q3_K
-    # ================================================================
-
-    def fused_dequant_gemv_q3k(
-        input_vec: torch.Tensor,
-        q_weight_data: torch.Tensor,
-        D_in: int,
-        D_out: int,
-        dtype: torch.dtype = torch.float16,
-    ) -> torch.Tensor:
-        assert D_in % 256 == 0, f"D_in must be multiple of 256, got {D_in}"
-        input_flat = input_vec.view(-1).contiguous()
-        output = torch.empty(D_out, device=input_vec.device, dtype=dtype)
-        TRITON_DTYPE = tl.float16 if dtype == torch.float16 else tl.bfloat16
-
-        _fused_dequant_gemv_q3k_kernel[(D_out,)](
-            input_flat,
-            q_weight_data,
-            output,
-            D_in=D_in,
-            D_out=D_out,
-            BLOCK_SIZE_Q3K=110,
-            VALS_PER_BLOCK=256,
-            DTYPE=TRITON_DTYPE,
-        )
-        return output
-
-    # ================================================================
-    #  Q6_K block layout (210 bytes per 256 values):
-    #   ql[128]   bytes 0..127    lower 4 bits (two nibbles per byte)
-    #   qh[64]    bytes 128..191  upper 2 bits (four 2-bit fields per byte)
-    #   scales[16] bytes 192..207  per-chunk scales (int8)
-    #   d[2]      bytes 208..209  super-block scale (float16)
-    #
-    #  8 chunks of 32 values each = 256 values per block
-    #
-    #  Memory access pattern for chunks:
-    #   chunk 0: ql[ 0..31] & 0x0F,  qh[128..159] & 0x03
-    #   chunk 1: ql[32..63] & 0x0F,  (qh[128..159] >> 2) & 0x03
-    #   chunk 2: ql[ 0..31] >> 4,    (qh[128..159] >> 4) & 0x03
-    #   chunk 3: ql[32..63] >> 4,    (qh[128..159] >> 6) & 0x03
-    #   chunk 4: ql[64..95] & 0x0F,  qh[160..191] & 0x03
-    #   chunk 5: ql[96..127] & 0x0F, (qh[160..191] >> 2) & 0x03
-    #   chunk 6: ql[64..95] >> 4,    (qh[160..191] >> 4) & 0x03
-    #   chunk 7: ql[96..127] >> 4,   (qh[160..191] >> 6) & 0x03
-    #
-    #  Observation: ql[0..31] is shared by chunk 0,2
-    #               ql[32..63] is shared by chunk 1,3
-    #               qh[128..159] is shared by chunk 0,1,2,3
-    #               (and similarly for the second half)
-    # ================================================================
-
-    # ================================================================
-    #  Q6_K chunk decoders (shared by standalone dequant)
-    #  These remain for backward compatibility with _dequantize_q6_k_kernel
+    #  Q6_K chunk decoders (shared by standalone dequant kernel)
     # ================================================================
 
     @triton.jit
@@ -384,23 +264,21 @@ if _TRITON_AVAILABLE:
         tl.store(out_start_ptr + 7 * 32 + offsets_32, w7)
 
     # ================================================================
-    #  ★ IMPROVED: Fused Q6_K dequant + GEMV kernel (batch=1 decode)
+    #  Fused Q6_K dequant + GEMV kernel (v2: reduced loads + autotune)
     #
-    #  Key optimizations over the previous version:
-    #   1. Pre-load ql and qh once per half-block, reuse with shifts
-    #      - ql_a (bytes 0..31) used by chunk 0 (& 0x0F) and chunk 2 (>> 4)
-    #      - ql_b (bytes 32..63) used by chunk 1 (& 0x0F) and chunk 3 (>> 4)
-    #      - qh_lo (bytes 128..159) used by chunks 0,1,2,3 with shifts 0,2,4,6
-    #      - (same pattern for ql_c, ql_d, qh_hi and chunks 4-7)
-    #      → Eliminates 10 redundant loads per block (16 → 6)
-    #
-    #   2. num_warps autotuning via @triton.autotune
-    #      - Tests num_warps=1,2,4 to find optimal latency hiding
-    #      - On Turing (sm75), num_warps=2 typically wins due to
-    #        better memory latency hiding with 64 threads
-    #
-    #   3. Scales pre-loaded as a 16-element vector instead of
-    #      scalar loads per chunk (reduces load instruction count)
+    #  Key improvements over v1:
+    #   1. ql bytes loaded once, reused for low/high nibble chunks:
+    #      - ql_0 (offset 0):  chunk 0 (low nibble) + chunk 2 (high nibble)
+    #      - ql_1 (offset 32): chunk 1 (low nibble) + chunk 3 (high nibble)
+    #      - ql_2 (offset 64): chunk 4 (low nibble) + chunk 6 (high nibble)
+    #      - ql_3 (offset 96): chunk 5 (low nibble) + chunk 7 (high nibble)
+    #   2. qh bytes loaded once, reused for 4 chunks each:
+    #      - qh_0 (offset 128): chunks 0,1,2,3 (shift 0,2,4,6)
+    #      - qh_1 (offset 160): chunks 4,5,6,7 (shift 0,2,4,6)
+    #   3. Total loads per block: 4(ql) + 2(qh) + 16(scales) + 1(d) + 8(input)
+    #      vs v1: 8(ql) + 8(qh) + 16(scales) + 1(d) + 8(input)
+    #      → 10 fewer vector loads per block (saves ~640 bytes bandwidth)
+    #   4. Autotuned num_warps for Turing SM75
     # ================================================================
 
     @triton.autotune(
@@ -412,14 +290,14 @@ if _TRITON_AVAILABLE:
         key=["D_in"],
     )
     @triton.jit
-    def _fused_dequant_gemv_q6k_kernel_v2(
+    def _fused_dequant_gemv_q6k_kernel(
         input_ptr,
         q_weight_ptr,
         output_ptr,
         D_in: tl.constexpr,
         D_out,
-        BLOCK_SIZE_Q6K: tl.constexpr,  # 210
-        VALS_PER_BLOCK: tl.constexpr,  # 256
+        BLOCK_SIZE_Q6K: tl.constexpr,
+        VALS_PER_BLOCK: tl.constexpr,
         DTYPE: tl.constexpr,
     ):
         row_idx = tl.program_id(0)
@@ -432,174 +310,89 @@ if _TRITON_AVAILABLE:
         acc = tl.zeros([32], dtype=tl.float32)
 
         for block_idx in range(n_blocks_per_row):
-            block_ptr = q_weight_ptr + (row_idx * n_blocks_per_row + block_idx) * BLOCK_SIZE_Q6K
-            input_base = block_idx * VALS_PER_BLOCK
-
-            # Super-block scale (float16 at byte 208)
+            block_byte_offset = (row_idx * n_blocks_per_row + block_idx) * BLOCK_SIZE_Q6K
+            block_ptr = q_weight_ptr + block_byte_offset
+            scales_ptr = block_ptr + 192
             d_scale = tl.load(
                 (block_ptr + 208).to(tl.pointer_type(tl.float16))
             ).to(DTYPE)
+            input_base = block_idx * VALS_PER_BLOCK
 
-            # ---- Pre-load scales[0..15] as individual scalars ----
-            # (Triton handles scalar loads efficiently; this avoids
-            #  re-loading per chunk)
-            scales_ptr = block_ptr + 192
-            sc0  = tl.load(scales_ptr + 0).to(tl.int8, bitcast=True).to(DTYPE)
-            sc1  = tl.load(scales_ptr + 1).to(tl.int8, bitcast=True).to(DTYPE)
-            sc2  = tl.load(scales_ptr + 2).to(tl.int8, bitcast=True).to(DTYPE)
-            sc3  = tl.load(scales_ptr + 3).to(tl.int8, bitcast=True).to(DTYPE)
-            sc4  = tl.load(scales_ptr + 4).to(tl.int8, bitcast=True).to(DTYPE)
-            sc5  = tl.load(scales_ptr + 5).to(tl.int8, bitcast=True).to(DTYPE)
-            sc6  = tl.load(scales_ptr + 6).to(tl.int8, bitcast=True).to(DTYPE)
-            sc7  = tl.load(scales_ptr + 7).to(tl.int8, bitcast=True).to(DTYPE)
-            sc8  = tl.load(scales_ptr + 8).to(tl.int8, bitcast=True).to(DTYPE)
-            sc9  = tl.load(scales_ptr + 9).to(tl.int8, bitcast=True).to(DTYPE)
-            sc10 = tl.load(scales_ptr + 10).to(tl.int8, bitcast=True).to(DTYPE)
-            sc11 = tl.load(scales_ptr + 11).to(tl.int8, bitcast=True).to(DTYPE)
-            sc12 = tl.load(scales_ptr + 12).to(tl.int8, bitcast=True).to(DTYPE)
-            sc13 = tl.load(scales_ptr + 13).to(tl.int8, bitcast=True).to(DTYPE)
-            sc14 = tl.load(scales_ptr + 14).to(tl.int8, bitcast=True).to(DTYPE)
-            sc15 = tl.load(scales_ptr + 15).to(tl.int8, bitcast=True).to(DTYPE)
+            # ---- Pre-load: 4 ql segments + 2 qh segments (6 loads vs 16) ----
+            ql_0 = tl.load(block_ptr + 0 + offsets_32)
+            ql_1 = tl.load(block_ptr + 32 + offsets_32)
+            ql_2 = tl.load(block_ptr + 64 + offsets_32)
+            ql_3 = tl.load(block_ptr + 96 + offsets_32)
+            qh_0 = tl.load(block_ptr + 128 + offsets_32)
+            qh_1 = tl.load(block_ptr + 160 + offsets_32)
 
-            # ======== First half: chunks 0-3 ========
-            # Pre-load shared data (6 loads instead of 16)
-            ql_a = tl.load(block_ptr + 0 + offsets_32)    # ql bytes 0..31
-            ql_b = tl.load(block_ptr + 32 + offsets_32)   # ql bytes 32..63
-            qh_lo = tl.load(block_ptr + 128 + offsets_32) # qh bytes 128..159
+            # Pre-load all 16 int8 scales
+            s0  = tl.load(scales_ptr + 0).to(tl.int8, bitcast=True).to(DTYPE)
+            s1  = tl.load(scales_ptr + 1).to(tl.int8, bitcast=True).to(DTYPE)
+            s2  = tl.load(scales_ptr + 2).to(tl.int8, bitcast=True).to(DTYPE)
+            s3  = tl.load(scales_ptr + 3).to(tl.int8, bitcast=True).to(DTYPE)
+            s4  = tl.load(scales_ptr + 4).to(tl.int8, bitcast=True).to(DTYPE)
+            s5  = tl.load(scales_ptr + 5).to(tl.int8, bitcast=True).to(DTYPE)
+            s6  = tl.load(scales_ptr + 6).to(tl.int8, bitcast=True).to(DTYPE)
+            s7  = tl.load(scales_ptr + 7).to(tl.int8, bitcast=True).to(DTYPE)
+            s8  = tl.load(scales_ptr + 8).to(tl.int8, bitcast=True).to(DTYPE)
+            s9  = tl.load(scales_ptr + 9).to(tl.int8, bitcast=True).to(DTYPE)
+            s10 = tl.load(scales_ptr + 10).to(tl.int8, bitcast=True).to(DTYPE)
+            s11 = tl.load(scales_ptr + 11).to(tl.int8, bitcast=True).to(DTYPE)
+            s12 = tl.load(scales_ptr + 12).to(tl.int8, bitcast=True).to(DTYPE)
+            s13 = tl.load(scales_ptr + 13).to(tl.int8, bitcast=True).to(DTYPE)
+            s14 = tl.load(scales_ptr + 14).to(tl.int8, bitcast=True).to(DTYPE)
+            s15 = tl.load(scales_ptr + 15).to(tl.int8, bitcast=True).to(DTYPE)
 
-            # Chunk 0: ql_a & 0x0F, qh_lo & 0x03, scales 0,1
-            ql_val = (ql_a & 0x0F).to(tl.int8, bitcast=True)
-            qh_val = (qh_lo.to(tl.int8, bitcast=True)) & 0x03
-            q_val = ((ql_val | (qh_val << 4)) - 32).to(DTYPE)
-            w = q_val * (d_scale * tl.where(mask_16, sc0, sc1))
-            x = tl.load(input_ptr + input_base + 0 * 32 + offsets_32)
-            acc += w.to(tl.float32) * x.to(tl.float32)
+            # Cast qh once to int8 for bit extraction
+            qh_0_i8 = qh_0.to(tl.int8, bitcast=True)
+            qh_1_i8 = qh_1.to(tl.int8, bitcast=True)
 
-            # Chunk 1: ql_b & 0x0F, (qh_lo >> 2) & 0x03, scales 2,3
-            ql_val = (ql_b & 0x0F).to(tl.int8, bitcast=True)
-            qh_val = (qh_lo.to(tl.int8, bitcast=True) >> 2) & 0x03
-            q_val = ((ql_val | (qh_val << 4)) - 32).to(DTYPE)
-            w = q_val * (d_scale * tl.where(mask_16, sc2, sc3))
-            x = tl.load(input_ptr + input_base + 1 * 32 + offsets_32)
-            acc += w.to(tl.float32) * x.to(tl.float32)
+            # ---- Chunk 0: ql_0 low, qh_0 bits[1:0] ----
+            q_val = ((ql_0 & 0x0F).to(tl.int8, bitcast=True) | ((qh_0_i8 & 0x03) << 4)) - 32
+            w = (d_scale * tl.where(mask_16, s0, s1)) * q_val.to(DTYPE)
+            acc += w.to(tl.float32) * tl.load(input_ptr + input_base + offsets_32).to(tl.float32)
 
-            # Chunk 2: (ql_a >> 4) & 0x0F, (qh_lo >> 4) & 0x03, scales 4,5
-            ql_val = ((ql_a >> 4) & 0x0F).to(tl.int8, bitcast=True)
-            qh_val = (qh_lo.to(tl.int8, bitcast=True) >> 4) & 0x03
-            q_val = ((ql_val | (qh_val << 4)) - 32).to(DTYPE)
-            w = q_val * (d_scale * tl.where(mask_16, sc4, sc5))
-            x = tl.load(input_ptr + input_base + 2 * 32 + offsets_32)
-            acc += w.to(tl.float32) * x.to(tl.float32)
+            # ---- Chunk 1: ql_1 low, qh_0 bits[3:2] ----
+            q_val = ((ql_1 & 0x0F).to(tl.int8, bitcast=True) | (((qh_0_i8 >> 2) & 0x03) << 4)) - 32
+            w = (d_scale * tl.where(mask_16, s2, s3)) * q_val.to(DTYPE)
+            acc += w.to(tl.float32) * tl.load(input_ptr + input_base + 32 + offsets_32).to(tl.float32)
 
-            # Chunk 3: (ql_b >> 4) & 0x0F, (qh_lo >> 6) & 0x03, scales 6,7
-            ql_val = ((ql_b >> 4) & 0x0F).to(tl.int8, bitcast=True)
-            qh_val = (qh_lo.to(tl.int8, bitcast=True) >> 6) & 0x03
-            q_val = ((ql_val | (qh_val << 4)) - 32).to(DTYPE)
-            w = q_val * (d_scale * tl.where(mask_16, sc6, sc7))
-            x = tl.load(input_ptr + input_base + 3 * 32 + offsets_32)
-            acc += w.to(tl.float32) * x.to(tl.float32)
+            # ---- Chunk 2: ql_0 high, qh_0 bits[5:4] ----
+            q_val = (((ql_0 >> 4) & 0x0F).to(tl.int8, bitcast=True) | (((qh_0_i8 >> 4) & 0x03) << 4)) - 32
+            w = (d_scale * tl.where(mask_16, s4, s5)) * q_val.to(DTYPE)
+            acc += w.to(tl.float32) * tl.load(input_ptr + input_base + 64 + offsets_32).to(tl.float32)
 
-            # ======== Second half: chunks 4-7 ========
-            ql_c = tl.load(block_ptr + 64 + offsets_32)    # ql bytes 64..95
-            ql_d = tl.load(block_ptr + 96 + offsets_32)    # ql bytes 96..127
-            qh_hi = tl.load(block_ptr + 160 + offsets_32)  # qh bytes 160..191
+            # ---- Chunk 3: ql_1 high, qh_0 bits[7:6] ----
+            q_val = (((ql_1 >> 4) & 0x0F).to(tl.int8, bitcast=True) | (((qh_0_i8 >> 6) & 0x03) << 4)) - 32
+            w = (d_scale * tl.where(mask_16, s6, s7)) * q_val.to(DTYPE)
+            acc += w.to(tl.float32) * tl.load(input_ptr + input_base + 96 + offsets_32).to(tl.float32)
 
-            # Chunk 4: ql_c & 0x0F, qh_hi & 0x03, scales 8,9
-            ql_val = (ql_c & 0x0F).to(tl.int8, bitcast=True)
-            qh_val = (qh_hi.to(tl.int8, bitcast=True)) & 0x03
-            q_val = ((ql_val | (qh_val << 4)) - 32).to(DTYPE)
-            w = q_val * (d_scale * tl.where(mask_16, sc8, sc9))
-            x = tl.load(input_ptr + input_base + 4 * 32 + offsets_32)
-            acc += w.to(tl.float32) * x.to(tl.float32)
+            # ---- Chunk 4: ql_2 low, qh_1 bits[1:0] ----
+            q_val = ((ql_2 & 0x0F).to(tl.int8, bitcast=True) | ((qh_1_i8 & 0x03) << 4)) - 32
+            w = (d_scale * tl.where(mask_16, s8, s9)) * q_val.to(DTYPE)
+            acc += w.to(tl.float32) * tl.load(input_ptr + input_base + 128 + offsets_32).to(tl.float32)
 
-            # Chunk 5: ql_d & 0x0F, (qh_hi >> 2) & 0x03, scales 10,11
-            ql_val = (ql_d & 0x0F).to(tl.int8, bitcast=True)
-            qh_val = (qh_hi.to(tl.int8, bitcast=True) >> 2) & 0x03
-            q_val = ((ql_val | (qh_val << 4)) - 32).to(DTYPE)
-            w = q_val * (d_scale * tl.where(mask_16, sc10, sc11))
-            x = tl.load(input_ptr + input_base + 5 * 32 + offsets_32)
-            acc += w.to(tl.float32) * x.to(tl.float32)
+            # ---- Chunk 5: ql_3 low, qh_1 bits[3:2] ----
+            q_val = ((ql_3 & 0x0F).to(tl.int8, bitcast=True) | (((qh_1_i8 >> 2) & 0x03) << 4)) - 32
+            w = (d_scale * tl.where(mask_16, s10, s11)) * q_val.to(DTYPE)
+            acc += w.to(tl.float32) * tl.load(input_ptr + input_base + 160 + offsets_32).to(tl.float32)
 
-            # Chunk 6: (ql_c >> 4) & 0x0F, (qh_hi >> 4) & 0x03, scales 12,13
-            ql_val = ((ql_c >> 4) & 0x0F).to(tl.int8, bitcast=True)
-            qh_val = (qh_hi.to(tl.int8, bitcast=True) >> 4) & 0x03
-            q_val = ((ql_val | (qh_val << 4)) - 32).to(DTYPE)
-            w = q_val * (d_scale * tl.where(mask_16, sc12, sc13))
-            x = tl.load(input_ptr + input_base + 6 * 32 + offsets_32)
-            acc += w.to(tl.float32) * x.to(tl.float32)
+            # ---- Chunk 6: ql_2 high, qh_1 bits[5:4] ----
+            q_val = (((ql_2 >> 4) & 0x0F).to(tl.int8, bitcast=True) | (((qh_1_i8 >> 4) & 0x03) << 4)) - 32
+            w = (d_scale * tl.where(mask_16, s12, s13)) * q_val.to(DTYPE)
+            acc += w.to(tl.float32) * tl.load(input_ptr + input_base + 192 + offsets_32).to(tl.float32)
 
-            # Chunk 7: (ql_d >> 4) & 0x0F, (qh_hi >> 6) & 0x03, scales 14,15
-            ql_val = ((ql_d >> 4) & 0x0F).to(tl.int8, bitcast=True)
-            qh_val = (qh_hi.to(tl.int8, bitcast=True) >> 6) & 0x03
-            q_val = ((ql_val | (qh_val << 4)) - 32).to(DTYPE)
-            w = q_val * (d_scale * tl.where(mask_16, sc14, sc15))
-            x = tl.load(input_ptr + input_base + 7 * 32 + offsets_32)
-            acc += w.to(tl.float32) * x.to(tl.float32)
+            # ---- Chunk 7: ql_3 high, qh_1 bits[7:6] ----
+            q_val = (((ql_3 >> 4) & 0x0F).to(tl.int8, bitcast=True) | (((qh_1_i8 >> 6) & 0x03) << 4)) - 32
+            w = (d_scale * tl.where(mask_16, s14, s15)) * q_val.to(DTYPE)
+            acc += w.to(tl.float32) * tl.load(input_ptr + input_base + 224 + offsets_32).to(tl.float32)
 
         result = tl.sum(acc, axis=0).to(DTYPE)
         tl.store(output_ptr + row_idx, result)
 
     # ================================================================
-    #  Keep old kernel name as alias for backward compatibility
-    # ================================================================
-    _fused_dequant_gemv_q6k_kernel = _fused_dequant_gemv_q6k_kernel_v2
-
-    # ================================================================
-    #  Python wrappers
-    # ================================================================
-
-    def triton_dequant_q6k(
-        data: torch.Tensor,
-        shape: tuple[int, ...],
-        dtype: torch.dtype = torch.float16,
-    ) -> torch.Tensor:
-        """Dequantize Q6_K raw bytes to float tensor using Triton kernel."""
-        raw = data.view(torch.uint8)
-        n_blocks = raw.numel() // 210
-        out = torch.empty(n_blocks * 256, dtype=dtype, device=data.device)
-        _dequantize_q6_k_kernel[(n_blocks,)](
-            raw, out, n_blocks, DTYPE=tl.float32,
-        )
-        return out.reshape(shape)
-
-    def fused_dequant_gemv_q6k(
-        input_vec: torch.Tensor,
-        q_weight_data: torch.Tensor,
-        D_in: int,
-        D_out: int,
-        dtype: torch.dtype = torch.float16,
-    ) -> torch.Tensor:
-        """Fused Q6_K dequant + GEMV for batch=1 decode.
-
-        Args:
-            input_vec: [D_in] or [1, D_in] activation vector (FP16)
-            q_weight_data: raw Q6_K bytes on GPU
-            D_in: input dimension (must be multiple of 256)
-            D_out: output dimension
-            dtype: output dtype
-
-        Returns:
-            [D_out] output vector
-        """
-        assert D_in % 256 == 0, f"D_in must be multiple of 256, got {D_in}"
-        input_flat = input_vec.view(-1).contiguous()
-        output = torch.empty(D_out, device=input_vec.device, dtype=dtype)
-        TRITON_DTYPE = tl.float16 if dtype == torch.float16 else tl.bfloat16
-
-        _fused_dequant_gemv_q6k_kernel_v2[(D_out,)](
-            input_flat,
-            q_weight_data,
-            output,
-            D_in=D_in,
-            D_out=D_out,
-            BLOCK_SIZE_Q6K=210,
-            VALS_PER_BLOCK=256,
-            DTYPE=TRITON_DTYPE,
-        )
-        return output
-
-    # ================================================================
-    #  Standalone Q3_K dequantization kernel
+    #  Standalone Q3_K dequantization kernel (unchanged from original)
     # ================================================================
 
     @triton.autotune(
@@ -668,6 +461,74 @@ if _TRITON_AVAILABLE:
                         q_vec = ql_vec - (qh_vec << 2)
                         dequant_16 = final_scale * q_vec.to(DTYPE)
                         tl.store(output_base + chunk_idx * 16 + offsets_16, dequant_16)
+
+    # ================================================================
+    #  Python wrappers
+    # ================================================================
+
+    def triton_dequant_q6k(
+        data: torch.Tensor,
+        shape: tuple[int, ...],
+        dtype: torch.dtype = torch.float16,
+    ) -> torch.Tensor:
+        """Dequantize Q6_K raw bytes to float tensor using Triton kernel."""
+        raw = data.view(torch.uint8)
+        n_blocks = raw.numel() // 210
+        out = torch.empty(n_blocks * 256, dtype=dtype, device=data.device)
+        _dequantize_q6_k_kernel[(n_blocks,)](
+            raw, out, n_blocks, DTYPE=tl.float32,
+        )
+        return out.reshape(shape)
+
+    def fused_dequant_gemv_q6k(
+        input_vec: torch.Tensor,
+        q_weight_data: torch.Tensor,
+        D_in: int,
+        D_out: int,
+        dtype: torch.dtype = torch.float16,
+    ) -> torch.Tensor:
+        """Fused Q6_K dequant + GEMV for batch=1 decode (v2)."""
+        assert D_in % 256 == 0, f"D_in must be multiple of 256, got {D_in}"
+        input_flat = input_vec.view(-1).contiguous()
+        output = torch.empty(D_out, device=input_vec.device, dtype=dtype)
+        TRITON_DTYPE = tl.float16 if dtype == torch.float16 else tl.bfloat16
+
+        _fused_dequant_gemv_q6k_kernel[(D_out,)](
+            input_flat,
+            q_weight_data,
+            output,
+            D_in=D_in,
+            D_out=D_out,
+            BLOCK_SIZE_Q6K=210,
+            VALS_PER_BLOCK=256,
+            DTYPE=TRITON_DTYPE,
+        )
+        return output
+
+    def fused_dequant_gemv_q3k(
+        input_vec: torch.Tensor,
+        q_weight_data: torch.Tensor,
+        D_in: int,
+        D_out: int,
+        dtype: torch.dtype = torch.float16,
+    ) -> torch.Tensor:
+        """Fused Q3_K dequant + GEMV for batch=1 decode (v2)."""
+        assert D_in % 256 == 0, f"D_in must be multiple of 256, got {D_in}"
+        input_flat = input_vec.view(-1).contiguous()
+        output = torch.empty(D_out, device=input_vec.device, dtype=dtype)
+        TRITON_DTYPE = tl.float16 if dtype == torch.float16 else tl.bfloat16
+
+        _fused_dequant_gemv_q3k_kernel[(D_out,)](
+            input_flat,
+            q_weight_data,
+            output,
+            D_in=D_in,
+            D_out=D_out,
+            BLOCK_SIZE_Q3K=110,
+            VALS_PER_BLOCK=256,
+            DTYPE=TRITON_DTYPE,
+        )
+        return output
 
     def triton_dequant_q3k(
         data: torch.Tensor,

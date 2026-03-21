@@ -47,6 +47,69 @@ else:
 
 
 # ================================================================
+#  torch custom op registration for torch.compile compatibility
+# ================================================================
+
+_CUSTOM_OPS_REGISTERED = False
+
+def _register_custom_ops():
+    """Register GGUFLinear fused GEMV as torch custom ops.
+    
+    This allows torch.compile to include these operations in its
+    graph without graph breaks, enabling CUDA Graph capture of the
+    entire decode step.
+    """
+    global _CUSTOM_OPS_REGISTERED
+    if _CUSTOM_OPS_REGISTERED:
+        return
+    if not _TRITON_AVAILABLE:
+        return
+
+    @torch.library.custom_op("gguf::fused_gemv_q6k", mutates_args=())
+    def _custom_fused_gemv_q6k(
+        input_vec: torch.Tensor,
+        q_weight_data: torch.Tensor,
+        D_in: int,
+        D_out: int,
+    ) -> torch.Tensor:
+        return fused_dequant_gemv_q6k(
+            input_vec, q_weight_data, D_in, D_out, dtype=input_vec.dtype
+        )
+
+    @_custom_fused_gemv_q6k.register_fake
+    def _fake_fused_gemv_q6k(
+        input_vec: torch.Tensor,
+        q_weight_data: torch.Tensor,
+        D_in: int,
+        D_out: int,
+    ) -> torch.Tensor:
+        return torch.empty(D_out, dtype=input_vec.dtype, device=input_vec.device)
+
+    @torch.library.custom_op("gguf::fused_gemv_q3k", mutates_args=())
+    def _custom_fused_gemv_q3k(
+        input_vec: torch.Tensor,
+        q_weight_data: torch.Tensor,
+        D_in: int,
+        D_out: int,
+    ) -> torch.Tensor:
+        return fused_dequant_gemv_q3k(
+            input_vec, q_weight_data, D_in, D_out, dtype=input_vec.dtype
+        )
+
+    @_custom_fused_gemv_q3k.register_fake
+    def _fake_fused_gemv_q3k(
+        input_vec: torch.Tensor,
+        q_weight_data: torch.Tensor,
+        D_in: int,
+        D_out: int,
+    ) -> torch.Tensor:
+        return torch.empty(D_out, dtype=input_vec.dtype, device=input_vec.device)
+
+    _CUSTOM_OPS_REGISTERED = True
+    logger.info("Registered custom ops: gguf::fused_gemv_q6k, gguf::fused_gemv_q3k")
+
+
+# ================================================================
 #  Low-level dequant functions (operate on raw uint8 blocks)
 # ================================================================
 
@@ -259,9 +322,8 @@ class GGUFParameter:
 
 
 class GGUFLinear(nn.Module):
-    """Linear layer with GGUF quantized weights and generation-phase caching."""
+    """Linear layer with GGUF quantized weights."""
 
-    # Class-level path tracking for diagnostics (set once per qtype)
     _path_logged: set = set()
 
     def __init__(self, qparam: GGUFParameter, bias=None):
@@ -270,7 +332,8 @@ class GGUFLinear(nn.Module):
         self.bias = bias
         self._cached_weight: torch.Tensor | None = None
         self._cache_dtype: torch.dtype | None = None
-        self._cache_enabled: bool = False  # Only cache during generation
+        self._cache_enabled: bool = False
+        self._use_custom_op: bool = False  # NEW: for torch.compile
 
     def _log_path(self, path_name: str):
         key = (self.qparam.qtype.name, path_name)
@@ -287,7 +350,39 @@ class GGUFLinear(nn.Module):
             w = self._cached_weight
             return F.linear(x, w, self.bias)
 
-        # Fused GEMV path: batch=1, Q6_K
+        # ---- Custom op path (for torch.compile) ----
+        if self._use_custom_op and _TRITON_AVAILABLE:
+            if (
+                self.qparam.qtype == gguf.GGMLQuantizationType.Q6_K
+                and self.qparam.data.is_cuda
+                and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1
+                and self.qparam.shape[1] % 256 == 0
+            ):
+                out = torch.ops.gguf.fused_gemv_q6k(
+                    x.view(-1), self.qparam.data,
+                    self.qparam.shape[1], self.qparam.shape[0],
+                )
+                out = out.view(1, 1, -1)
+                if self.bias is not None:
+                    out = out + self.bias
+                return out
+            
+            if (
+                self.qparam.qtype == gguf.GGMLQuantizationType.Q3_K
+                and self.qparam.data.is_cuda
+                and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1
+                and self.qparam.shape[1] % 256 == 0
+            ):
+                out = torch.ops.gguf.fused_gemv_q3k(
+                    x.view(-1), self.qparam.data,
+                    self.qparam.shape[1], self.qparam.shape[0],
+                )
+                out = out.view(1, 1, -1)
+                if self.bias is not None:
+                    out = out + self.bias
+                return out
+
+        # ---- Direct Triton path (no torch.compile) ----
         if (
             _TRITON_AVAILABLE
             and self.qparam.qtype == gguf.GGMLQuantizationType.Q6_K
@@ -305,9 +400,6 @@ class GGUFLinear(nn.Module):
                 out = out + self.bias
             return out
 
-        # Fused GEMV path: batch=1, Q3_K
-        # NOTE: Triton JIT compilation makes the first call slow.
-        # Use warmup_triton_kernels() at model load time to avoid this.
         if (
             _TRITON_AVAILABLE
             and fused_dequant_gemv_q3k is not None
@@ -520,3 +612,20 @@ def warmup_triton_kernels(model: nn.Module, dtype: torch.dtype = torch.float16) 
     logger.info(
         f"Triton kernel warmup complete: {len(seen_shapes)} unique shapes compiled"
     )
+
+def enable_custom_op_mode(model: nn.Module):
+    """Enable custom_op mode on all GGUFLinear modules for torch.compile."""
+    _register_custom_ops()
+    count = 0
+    for module in model.modules():
+        if isinstance(module, GGUFLinear):
+            module._use_custom_op = True
+            count += 1
+    logger.info(f"Enabled custom_op mode on {count} GGUFLinear modules")
+
+
+def disable_custom_op_mode(model: nn.Module):
+    """Disable custom_op mode."""
+    for module in model.modules():
+        if isinstance(module, GGUFLinear):
+            module._use_custom_op = False
