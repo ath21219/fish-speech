@@ -22,6 +22,7 @@ from fish_speech.content_sequence import (
 )
 from fish_speech.conversation import Conversation, Message
 from fish_speech.tokenizer import IM_END_TOKEN
+from fish_speech.models.text2semantic.llama import Attention
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch._inductor.config.coordinate_descent_tuning = True
@@ -177,6 +178,19 @@ class CUDAGraphRunner:
                 logger.debug(f"[CUDA Graph] Cached GGUFEmbedding: {name} "
                              f"({cached_w.shape}, {cached_w.nbytes/1e6:.1f} MB)")
 
+        # ── Phase 0c: Attention._neg_inf を GPU 上に作成 ──
+        neg_inf_count = 0
+        for name, module in model.named_modules():
+            if isinstance(module, Attention):
+                module._neg_inf = torch.tensor(
+                    float("-inf"), device=device, dtype=torch.float16
+                )
+                neg_inf_count += 1
+        logger.info(
+            "[CUDA Graph] Phase 0c: Set _neg_inf on %d Attention modules (device=%s)",
+            neg_inf_count,
+            device,
+        )
 
         # ── Phase 1: Warmup on side stream ──
         logger.info("[CUDA Graph] Warming up decode function...")
