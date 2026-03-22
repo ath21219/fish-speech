@@ -31,9 +31,6 @@ torch._inductor.config.triton.unique_kernel_names = True
 if hasattr(torch._inductor.config, "fx_graph_cache"):
     torch._inductor.config.fx_graph_cache = True
 
-
-from torch.nn.attention import SDPBackend, sdpa_kernel
-
 # ============================================================
 # [OPT-B6] Manual CUDA Graph capture for decode step
 # ============================================================
@@ -490,65 +487,64 @@ def decode_n_tokens(
     buf_pos = 0
     finished = False
 
-    with sdpa_kernel(SDPBackend.MATH):
-        for i in range(num_new_tokens):
-            if graph_runner is not None and graph_runner.captured:
-                # ── CUDA Graph replay path ──
-                next_token = graph_runner.replay(
-                    x=fixed_cur_token,
-                    input_pos=fixed_input_pos,
-                    temperature=temperature,
-                    top_p=top_p,
-                    previous_tokens=previous_tokens,
-                )
-            else:
-                # ── Eager fallback path ──
-                next_token = decode_one_token(
-                    model=model,
-                    x=fixed_cur_token,
-                    input_pos=fixed_input_pos,
-                    previous_tokens=previous_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    semantic_logit_bias=semantic_logit_bias,
-                    audio_masks=audio_masks,
-                    audio_parts=audio_parts,
-                )
+    for i in range(num_new_tokens):
+        if graph_runner is not None and graph_runner.captured:
+            # ── CUDA Graph replay path ──
+            next_token = graph_runner.replay(
+                x=fixed_cur_token,
+                input_pos=fixed_input_pos,
+                temperature=temperature,
+                top_p=top_p,
+                previous_tokens=previous_tokens,
+            )
+        else:
+            # ── Eager fallback path ──
+            next_token = decode_one_token(
+                model=model,
+                x=fixed_cur_token,
+                input_pos=fixed_input_pos,
+                previous_tokens=previous_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                semantic_logit_bias=semantic_logit_bias,
+                audio_masks=audio_masks,
+                audio_parts=audio_parts,
+            )
 
-            # Update fixed buffers in-place
-            fixed_input_pos.add_(1)
-            fixed_cur_token.copy_(next_token.view(1, codebook_dim, 1))
+        # Update fixed buffers in-place
+        fixed_input_pos.add_(1)
+        fixed_cur_token.copy_(next_token.view(1, codebook_dim, 1))
 
-            # RAS circular buffer
-            previous_tokens[:, ras_pos % RAS_WIN_SIZE] = next_token.view(
-                codebook_dim, -1
-            )[:, 0]
-            ras_pos += 1
-            new_tokens.append(next_token)
+        # RAS circular buffer
+        previous_tokens[:, ras_pos % RAS_WIN_SIZE] = next_token.view(
+            codebook_dim, -1
+        )[:, 0]
+        ras_pos += 1
+        new_tokens.append(next_token)
 
-            # Batched im_end check
-            semantic_id_buffer[buf_pos] = next_token[0, 0]
-            buf_pos += 1
+        # Batched im_end check
+        semantic_id_buffer[buf_pos] = next_token[0, 0]
+        buf_pos += 1
 
-            if buf_pos >= CHECK_INTERVAL:
-                if (semantic_id_buffer[:buf_pos] == im_end_tensor).any().item():
-                    match_mask = semantic_id_buffer[:buf_pos] == im_end_tensor
-                    first_match = match_mask.nonzero(as_tuple=False)[0, 0].item()
-                    tokens_to_remove = buf_pos - first_match - 1
-                    if tokens_to_remove > 0:
-                        new_tokens = new_tokens[:-tokens_to_remove]
-                    finished = True
-                    break
-                buf_pos = 0
-
-        if not finished and buf_pos > 0:
+        if buf_pos >= CHECK_INTERVAL:
             if (semantic_id_buffer[:buf_pos] == im_end_tensor).any().item():
                 match_mask = semantic_id_buffer[:buf_pos] == im_end_tensor
                 first_match = match_mask.nonzero(as_tuple=False)[0, 0].item()
                 tokens_to_remove = buf_pos - first_match - 1
                 if tokens_to_remove > 0:
                     new_tokens = new_tokens[:-tokens_to_remove]
+                finished = True
+                break
+            buf_pos = 0
+
+    if not finished and buf_pos > 0:
+        if (semantic_id_buffer[:buf_pos] == im_end_tensor).any().item():
+            match_mask = semantic_id_buffer[:buf_pos] == im_end_tensor
+            first_match = match_mask.nonzero(as_tuple=False)[0, 0].item()
+            tokens_to_remove = buf_pos - first_match - 1
+            if tokens_to_remove > 0:
+                new_tokens = new_tokens[:-tokens_to_remove]
 
     # Cleanup
     if graph_runner is not None:

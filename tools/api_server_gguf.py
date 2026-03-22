@@ -787,7 +787,6 @@ def _generate_streaming(
         decode_to_audio,
     )
     from fish_speech.tokenizer import IM_END_TOKEN
-    from torch.nn.attention import SDPBackend, sdpa_kernel
 
     # --- setup (変更なし) ---
     device = prompt.device
@@ -914,93 +913,91 @@ def _generate_streaming(
             logger.warning(f"[CUDA Graph] Streaming capture failed ({e}), using eager")
             graph_runner = None
 
-    # [OPT-F19] sdpa_kernel context outside loop
-    with sdpa_kernel(SDPBackend.MATH):
-        while not finished and total_tokens < effective_max:
-            if graph_runner is not None and graph_runner.captured:
-                next_token = graph_runner.replay(
-                    x=fixed_cur_token,
-                    input_pos=fixed_input_pos,
-                    temperature=temperature_t,
-                    top_p=top_p_t,
-                    previous_tokens=previous_tokens,
-                )
-            else:
-                next_token = decode_one_token(
-                    model=model,
-                    x=fixed_cur_token,
-                    input_pos=fixed_input_pos,
-                    temperature=temperature_t,
-                    top_p=top_p_t,
-                    top_k=top_k,
-                    semantic_logit_bias=semantic_logit_bias,
-                    audio_masks=audio_masks,
-                    audio_parts=audio_parts,
-                    previous_tokens=previous_tokens,
-                )
-
-            # [OPT-B6] In-place buffer updates (preserves tensor address)
-            fixed_input_pos.add_(1)                        # ★変更: += 1 ではなく .add_(1)
-            fixed_cur_token.copy_(                         # ★変更: = ではなく .copy_()
-                next_token.view(1, codebook_dim, 1)
+    while not finished and total_tokens < effective_max:
+        if graph_runner is not None and graph_runner.captured:
+            next_token = graph_runner.replay(
+                x=fixed_cur_token,
+                input_pos=fixed_input_pos,
+                temperature=temperature_t,
+                top_p=top_p_t,
+                previous_tokens=previous_tokens,
+            )
+        else:
+            next_token = decode_one_token(
+                model=model,
+                x=fixed_cur_token,
+                input_pos=fixed_input_pos,
+                temperature=temperature_t,
+                top_p=top_p_t,
+                top_k=top_k,
+                semantic_logit_bias=semantic_logit_bias,
+                audio_masks=audio_masks,
+                audio_parts=audio_parts,
+                previous_tokens=previous_tokens,
             )
 
-            previous_tokens[:, ras_pos % RAS_WIN_SIZE] = next_token.view(
-                codebook_dim, -1
-            )[:, 0]
-            ras_pos += 1
-            total_tokens += 1
+        # [OPT-B6] In-place buffer updates (preserves tensor address)
+        fixed_input_pos.add_(1)                        # ★変更: += 1 ではなく .add_(1)
+        fixed_cur_token.copy_(                         # ★変更: = ではなく .copy_()
+            next_token.view(1, codebook_dim, 1)
+        )
 
-            all_new_tokens.append(next_token)
-            pending_tokens.append(next_token)
-            tokens_since_last_chunk += 1
+        previous_tokens[:, ras_pos % RAS_WIN_SIZE] = next_token.view(
+            codebook_dim, -1
+        )[:, 0]
+        ras_pos += 1
+        total_tokens += 1
 
-            # [OPT-F19] Batched im_end check (replaces per-token GPU→CPU sync)
-            semantic_id_buffer[buf_pos] = next_token[0, 0]  # ★変更
-            buf_pos += 1                                     # ★変更
+        all_new_tokens.append(next_token)
+        pending_tokens.append(next_token)
+        tokens_since_last_chunk += 1
 
-            if buf_pos >= CHECK_INTERVAL:                    # ★変更ここから
-                if (semantic_id_buffer[:buf_pos] == im_end_tensor).any().item():
-                    match_mask = (semantic_id_buffer[:buf_pos] == im_end_tensor)
-                    first_match = match_mask.nonzero(as_tuple=False)[0, 0].item()
-                    tokens_to_discard = buf_pos - first_match - 1
-                    if tokens_to_discard > 0:
-                        all_new_tokens = all_new_tokens[:-tokens_to_discard]
-                        pending_tokens = pending_tokens[:-tokens_to_discard]
-                        tokens_since_last_chunk -= tokens_to_discard
-                        total_tokens -= tokens_to_discard
-                    finished = True
-                buf_pos = 0                                  # ★変更ここまで
+        # [OPT-F19] Batched im_end check (replaces per-token GPU→CPU sync)
+        semantic_id_buffer[buf_pos] = next_token[0, 0]  # ★変更
+        buf_pos += 1                                     # ★変更
 
-            # --- Emit chunk (変更なし) ---
-            threshold = min_first_chunk if is_first_chunk else chunk_size
-            should_emit = (
-                (streaming and tokens_since_last_chunk >= threshold) or finished
-            )
+        if buf_pos >= CHECK_INTERVAL:                    # ★変更ここから
+            if (semantic_id_buffer[:buf_pos] == im_end_tensor).any().item():
+                match_mask = (semantic_id_buffer[:buf_pos] == im_end_tensor)
+                first_match = match_mask.nonzero(as_tuple=False)[0, 0].item()
+                tokens_to_discard = buf_pos - first_match - 1
+                if tokens_to_discard > 0:
+                    all_new_tokens = all_new_tokens[:-tokens_to_discard]
+                    pending_tokens = pending_tokens[:-tokens_to_discard]
+                    tokens_since_last_chunk -= tokens_to_discard
+                    total_tokens -= tokens_to_discard
+                finished = True
+            buf_pos = 0                                  # ★変更ここまで
 
-            if should_emit and pending_tokens:
-                chunk_all = torch.cat(pending_tokens, dim=1)
-                codes_new = chunk_all[1:, :].clone().clamp(min=0)
+        # --- Emit chunk (変更なし) ---
+        threshold = min_first_chunk if is_first_chunk else chunk_size
+        should_emit = (
+            (streaming and tokens_since_last_chunk >= threshold) or finished
+        )
 
-                if codes_new.shape[1] > 0:
-                    t_dec = time.perf_counter()
-                    audio_np = streaming_decoder.decode_chunk(codes_new)
-                    t_dec_ms = (time.perf_counter() - t_dec) * 1000
+        if should_emit and pending_tokens:
+            chunk_all = torch.cat(pending_tokens, dim=1)
+            codes_new = chunk_all[1:, :].clone().clamp(min=0)
 
-                    if len(audio_np) > 0:
-                        chunk_duration = len(audio_np) / state.sample_rate
-                        logger.debug(
-                            f"Streaming decode: {codes_new.shape[1]} frames → "
-                            f"{chunk_duration:.2f}s audio in {t_dec_ms:.0f}ms"
-                        )
-                        yield {"type": "codes", "codes": codes_new.cpu()}
-                        yield {"type": "audio_chunk", "audio": audio_np}
+            if codes_new.shape[1] > 0:
+                t_dec = time.perf_counter()
+                audio_np = streaming_decoder.decode_chunk(codes_new)
+                t_dec_ms = (time.perf_counter() - t_dec) * 1000
 
-                pending_tokens = []
-                tokens_since_last_chunk = 0
-                is_first_chunk = False
+                if len(audio_np) > 0:
+                    chunk_duration = len(audio_np) / state.sample_rate
+                    logger.debug(
+                        f"Streaming decode: {codes_new.shape[1]} frames → "
+                        f"{chunk_duration:.2f}s audio in {t_dec_ms:.0f}ms"
+                    )
+                    yield {"type": "codes", "codes": codes_new.cpu()}
+                    yield {"type": "audio_chunk", "audio": audio_np}
 
-    # ★変更: ループ後の残りバッファチェック
+            pending_tokens = []
+            tokens_since_last_chunk = 0
+            is_first_chunk = False
+
+    # ループ後の残りバッファチェック
     if not finished and buf_pos > 0:
         if (semantic_id_buffer[:buf_pos] == im_end_tensor).any().item():
             match_mask = (semantic_id_buffer[:buf_pos] == im_end_tensor)
