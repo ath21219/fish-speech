@@ -339,11 +339,15 @@ class GGUFLinear(nn.Module):
         key = (self.qparam.qtype.name, path_name)
         if key not in GGUFLinear._path_logged:
             GGUFLinear._path_logged.add(key)
-            logger.info(
+            # fallback_dequant is expected during prefill, use DEBUG
+            level = "DEBUG" if "fallback" in path_name else "INFO"
+            logger.log(
+                level,
                 f"GGUFLinear path: {path_name} "
                 f"(qtype={self.qparam.qtype.name}, "
                 f"shape={self.qparam.shape})"
             )
+
 
     def forward(self, x):
         if self._cache_enabled and self._cached_weight is not None and self._cache_dtype == x.dtype:

@@ -33,6 +33,124 @@ from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List
 from contextlib import contextmanager
 
+# ============================================================
+# Logging setup — add to api_server_gguf.py after imports
+# ============================================================
+
+import logging
+import warnings
+
+
+def setup_logging(log_level: str = "INFO", docker_mode: bool = True):
+    """
+    Unified logging setup for the GGUF API server.
+    
+    Goals:
+      1. Single timestamp (loguru only, no Docker double-timestamp)
+      2. Consistent format across loguru / uvicorn / warnings
+      3. Health check noise suppression
+      4. Concise but informative format
+    
+    Args:
+        log_level: "DEBUG", "INFO", "WARNING", etc.
+        docker_mode: If True, omit timestamp (Docker adds its own).
+                     If False, include timestamp for local dev.
+    """
+    import sys
+    
+    # ── 1. Configure loguru ──
+    logger.remove()  # Remove default handler
+    
+    if docker_mode:
+        # Docker adds timestamps, so we omit them.
+        # Format: "INFO | module:func:line - message"
+        fmt = (
+            "<level>{level:<8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+            "<level>{message}</level>"
+        )
+    else:
+        # Local dev: include concise timestamp
+        fmt = (
+            "<green>{time:HH:mm:ss.SSS}</green> | "
+            "<level>{level:<8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+            "<level>{message}</level>"
+        )
+    
+    logger.add(
+        sys.stderr,
+        format=fmt,
+        level=log_level,
+        colorize=True,
+        backtrace=True,
+        diagnose=False,  # Don't show variable values in tracebacks (security)
+    )
+    
+    # ── 2. Route Python warnings through loguru ──
+    # This captures FutureWarning from torch.nn.utils.weight_norm etc.
+    def _warning_handler(message, category, filename, lineno, file=None, line=None):
+        logger.opt(depth=2).warning(
+            f"{category.__name__}: {message} ({filename}:{lineno})"
+        )
+    
+    warnings.showwarning = _warning_handler
+    
+    # ── 3. Route standard logging (uvicorn, etc.) through loguru ──
+    class _LoguruHandler(logging.Handler):
+        """Bridge stdlib logging → loguru."""
+        
+        _LEVEL_MAP = {
+            logging.DEBUG: "DEBUG",
+            logging.INFO: "INFO",
+            logging.WARNING: "WARNING",
+            logging.ERROR: "ERROR",
+            logging.CRITICAL: "CRITICAL",
+        }
+        
+        def emit(self, record):
+            # Skip health check access logs
+            msg = record.getMessage()
+            if "/v1/health" in msg:
+                return
+            
+            level = self._LEVEL_MAP.get(record.levelno, "INFO")
+            logger.opt(depth=6, exception=record.exc_info).log(level, msg)
+    
+    # Replace all existing handlers on uvicorn loggers
+    loguru_handler = _LoguruHandler()
+    for logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error", "fastapi"):
+        stdlib_logger = logging.getLogger(logger_name)
+        stdlib_logger.handlers.clear()
+        stdlib_logger.addHandler(loguru_handler)
+        stdlib_logger.setLevel(getattr(logging, log_level))
+        stdlib_logger.propagate = False
+    
+    # Also catch root logger (for any stray logging.info() calls)
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.addHandler(loguru_handler)
+    root_logger.setLevel(logging.WARNING)  # Only warnings+ from unknown sources
+    
+    logger.info("Logging initialized")
+
+
+def print_startup_banner(args, codec_source: str = "Embedded"):
+    """Print a clean startup banner."""
+    logger.info("=" * 50)
+    logger.info("Fish Speech GGUF API Server")
+    logger.info("=" * 50)
+    logger.info(f"  Model:       {args.model_name or '(none)'}")
+    logger.info(f"  Codec:       {codec_source}")
+    logger.info(f"  Listen:      {args.listen}")
+    logger.info(f"  Max seq len: {args.max_seq_len}")
+    logger.info(f"  Device:      {args.device}")
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        logger.info(f"  GPU:         {gpu_name} ({vram_total:.1f} GB)")
+    logger.info("=" * 50)
+
 # Add project root
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -1590,45 +1708,41 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Fish Speech GGUF API Server")
+    parser.add_argument("--model-name", type=str, default=None)
+    parser.add_argument("--listen", type=str, default="0.0.0.0:7820")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--max-seq-len", type=int, default=2048)
+    parser.add_argument("--codec-path", type=str, default=None)
+    parser.add_argument("--log-level", type=str, default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--no-docker-log", action="store_true",
+                        help="Include timestamps in logs (for local dev)")
+    args = parser.parse_args()
 
-    # API key middleware
-    if args.api_key:
-        @app.middleware("http")
-        async def auth_middleware(request, call_next):
-            if request.url.path == "/v1/health":
-                return await call_next(request)
-            auth = request.headers.get("Authorization", "")
-            if not auth.startswith("Bearer ") or auth[7:] != args.api_key:
-                return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-            return await call_next(request)
+    # ── Logging setup (must be FIRST) ──
+    setup_logging(
+        log_level=args.log_level,
+        docker_mode=not args.no_docker_log,
+    )
 
-    # Max text length check
-    if args.max_text_length > 0:
-        state._max_text_length = args.max_text_length
+    # ── Startup banner ──
+    codec_source = "External" if args.codec_path else "Embedded"
+    print_startup_banner(args, codec_source)
 
-    # Check port availability before expensive model loading
-    import socket
-    host, port = args.listen.rsplit(":", 1)
-    if host.startswith("[") and host.endswith("]"):
-        host = host[1:-1]
-    port = int(port)
-
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind((host if host != "0.0.0.0" else "", port))
-    except OSError as e:
-        logger.error(f"Port {port} is already in use: {e}")
-        sys.exit(1)
-
-    # Initialize models directory
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Load models (heavy operation)
+    # ── Load models ──
     if args.model_name:
-        load_models(args, args.model_name)
-    else:
-        logger.info("Starting without an active model. Use POST /v1/models/{id}/load to load one.")
+        load_models(args, name=args.model_name)
 
-    logger.info(f"Starting server on {host}:{port}")
-    uvicorn.run(app, host=host, port=port, workers=args.workers, log_level="info")
+    # ── Start server ──
+    host, port = args.listen.rsplit(":", 1)
+    logger.info(f"Starting server on {args.listen}")
+
+    uvicorn.run(
+        app,
+        host=host,
+        port=int(port),
+        log_level=args.log_level.lower(),
+        access_log=True,  # Keep access log but health checks are filtered
+        log_config=None,  # Disable uvicorn's default log config (we use loguru)
+    )
