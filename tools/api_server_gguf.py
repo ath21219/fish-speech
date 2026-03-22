@@ -1709,7 +1709,7 @@ def parse_args():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fish Speech GGUF API Server")
-    parser.add_argument("--model-name", type=str, default=None)
+    parser.add_argument("--model-name", type=str, default="s2-pro-q6_k")
     parser.add_argument("--listen", type=str, default="0.0.0.0:7820")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--max-seq-len", type=int, default=2048)
