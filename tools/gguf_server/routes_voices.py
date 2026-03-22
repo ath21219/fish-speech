@@ -13,6 +13,11 @@ from .codec_manager import codec_on_gpu, restore_after_codec
 from .schemas import CODEC_MAX_SECONDS
 from .state import REFERENCES_DIR, state
 
+from fish_speech.gguf.kv_cache_store import (
+    invalidate_kv_cache,
+    precompile_kv_cache,
+)
+
 router = APIRouter()
 
 
@@ -57,8 +62,10 @@ async def create_voice(
         if transcription:
             (voice_dir / "audio.txt").write_text(transcription, encoding="utf-8")
 
-        # Pre-encode VQ codes
+        # Pre-encode VQ codes and pre-compile KV cache
+        codes_cpu = None
         if state.ready:
+            # Phase 1: Encode audio → VQ codes (requires codec on GPU)
             try:
                 import torchaudio
 
@@ -96,15 +103,27 @@ async def create_voice(
                     )
                     codes = indices[0, :, : feature_lengths[0]]
 
-                torch.save(codes.cpu(), voice_dir / "codes.pt")
+                codes_cpu = codes.cpu()
+                torch.save(codes_cpu, voice_dir / "codes.pt")
+                # Invalidate any stale KV cache (codes changed)
+                invalidate_kv_cache(name)
                 logger.info(
-                    f"Voice '{name}': pre-encoded {codes.shape[1]} VQ frames"
+                    f"Voice '{name}': pre-encoded {codes_cpu.shape[1]} VQ frames"
                 )
 
             except Exception as e:
                 logger.warning(f"Voice '{name}': pre-encoding failed: {e}")
             finally:
                 restore_after_codec()
+
+            # KV cache will be built lazily on the first TTS request
+            # using the same code path (decode_one_token_ar → forward_generate)
+            # to ensure GGUF weight cache hooks and runtime optimizations
+            # are identical between cache creation and cache consumption.
+            if codes_cpu is not None and transcription:
+                logger.info(
+                    f"Voice '{name}': KV cache will be built on first TTS request"
+                )
 
         logger.info(
             f"Voice '{name}' registered: {audio_path} ({len(audio_bytes)} bytes)"
@@ -201,6 +220,9 @@ async def delete_voice(name: str):
     if not voice_dir.exists():
         raise HTTPException(404, f"Voice '{name}' not found")
 
+    # KV cache is inside voice_dir so rmtree handles it,
+    # but call invalidate for logging consistency.
+    invalidate_kv_cache(name)
     shutil.rmtree(voice_dir)
     logger.info(f"Voice '{name}' deleted")
     return {"message": f"Voice '{name}' deleted successfully"}

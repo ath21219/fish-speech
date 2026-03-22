@@ -26,6 +26,12 @@ from .schemas import (
 )
 from .state import state
 
+from fish_speech.gguf.kv_cache_store import (
+    compute_cache_key,
+    load_kv_cache,
+    save_kv_cache,
+)
+
 
 def generate_speech_streaming(req: TTSRequest):
     """
@@ -83,7 +89,7 @@ def generate_speech_streaming(req: TTSRequest):
         meta_file = ref_dir / "meta.json"
         if meta_file.exists():
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
-            ref_text = meta.get("description", "")
+            ref_text = meta.get("transcription", "")
         if not ref_text:
             txt_files = list(ref_dir.glob("*.txt"))
             if txt_files:
@@ -130,6 +136,27 @@ def generate_speech_streaming(req: TTSRequest):
             add_im_end=True,
         )
     )
+
+    # ── Compute prefix for KV cache ──
+    # Encode the system message (with reference) alone to determine the
+    # reusable prefix length.  This prefix is identical across all batches
+    # and across requests that share the same reference_id.
+    prefix_len = 0
+    cache_key = ""
+    ref_id = req.reference_id or ""
+
+    if use_prompt and ref_id:
+        num_codebooks = model.config.num_codebooks
+        prefix_conv = deepcopy(base_conversation)
+        prefix_encoded, _, _ = prefix_conv.encode_for_inference(
+            tokenizer, num_codebooks=num_codebooks
+        )
+        prefix_len = prefix_encoded.shape[1]
+        cache_key = compute_cache_key(prefix_encoded)
+        logger.info(
+            f"Reference prefix: {prefix_len} tokens, "
+            f"cache_key={cache_key}, ref_id={ref_id}"
+        )
 
     # ── Split text and generate ──
     turns = split_text_by_speaker(req.text)
@@ -200,6 +227,9 @@ def generate_speech_streaming(req: TTSRequest):
                 chunk_size=STREAM_CHUNK_TOKENS,
                 min_first_chunk=STREAM_MIN_FIRST_CHUNK,
                 streaming=req.streaming,
+                ref_id=ref_id,
+                prefix_len=prefix_len,
+                cache_key=cache_key,
             )
 
             for event in y:
@@ -285,12 +315,16 @@ def _generate_streaming(
     chunk_size=21,
     min_first_chunk=21,
     streaming=True,
+    ref_id="",
+    prefix_len=0,
+    cache_key="",
 ):
     """
     Token-by-token generation with streaming codec decode.
 
     [OPT-F19] Batched im_end check, no tqdm.
     [OPT-B6]  Fixed-address buffers for CUDA Graph compatibility.
+    [OPT-KVC] Reference KV cache: skip prefill for cached prefix tokens.
     """
     from fish_speech.models.text2semantic.inference import (
         CUDAGraphRunner,
@@ -347,28 +381,117 @@ def _generate_streaming(
         max_frames=effective_max + 64,
     )
 
-    # ── Prefill ──
-    input_pos = torch.arange(0, T, device=device, dtype=torch.long)
-    prompt_3d = prompt[None].repeat(1, 1, 1)
+    # ── Zero KV caches to prevent stale data from prior generations ──
+    for layer in model.layers:
+        kv = layer.attention.kv_cache
+        if kv is not None:
+            kv.k_cache.zero_()
+            kv.v_cache.zero_()
 
+    # ── [OPT-KVC] Try to load cached KV for reference prefix ──
+    cached_prefix_len = 0
+    should_save_cache = False
+
+    if ref_id and prefix_len > 0 and cache_key:
+        # Verify prefix tokens of the full prompt match the standalone prefix
+        actual_prefix_key = compute_cache_key(prompt[:, :prefix_len])
+        if actual_prefix_key != cache_key:
+            logger.warning(
+                f"[KV Cache] Prefix token mismatch! "
+                f"standalone={cache_key}, actual={actual_prefix_key}. "
+                f"Skipping cache."
+            )
+        else:
+            loaded = load_kv_cache(ref_id, model, cache_key, device)
+            if loaded is not None:
+                cached_prefix_len = loaded
+                logger.info(
+                    f"[KV Cache HIT] ref={ref_id}, "
+                    f"skipping {cached_prefix_len}/{T} prefix tokens"
+                )
+            else:
+                # Cache miss — will save after full prefill
+                should_save_cache = True
+                logger.info(
+                    f"[KV Cache MISS] ref={ref_id}, "
+                    f"will save after prefill ({prefix_len} tokens)"
+                )
+
+    # ── Prefill ──
     RAS_WIN_SIZE = 10
     previous_tokens = torch.zeros(
         (codebook_dim, RAS_WIN_SIZE), dtype=torch.int, device=device
     )
     ras_pos = 0
 
-    first_token = decode_one_token(
-        model=model,
-        x=prompt_3d,
-        input_pos=input_pos,
-        temperature=temperature_t,
-        top_p=top_p_t,
-        top_k=top_k,
-        semantic_logit_bias=semantic_logit_bias,
-        audio_masks=audio_masks,
-        audio_parts=audio_parts,
-        previous_tokens=previous_tokens,
-    )
+    if cached_prefix_len > 0 and cached_prefix_len <= T:
+        # [OPT-KVC] Partial prefill: only process suffix tokens.
+        # KV cache for positions 0..cached_prefix_len-1 is already loaded.
+        t_prefill = time.perf_counter()
+        suffix_start = cached_prefix_len
+        input_pos = torch.arange(
+            suffix_start, T, device=device, dtype=torch.long
+        )
+        prompt_suffix = prompt[None, :, suffix_start:].contiguous()
+
+        # Slice audio_masks/audio_parts for suffix only
+        suffix_audio_masks = None
+        suffix_audio_parts = None
+        if audio_masks is not None:
+            suffix_audio_masks = audio_masks[:, suffix_start:]
+            # Count how many audio positions are in the prefix vs suffix
+            prefix_audio_count = audio_masks[:, :suffix_start].sum().item()
+            total_audio_count = audio_masks.sum().item()
+            suffix_audio_count = int(total_audio_count - prefix_audio_count)
+            if suffix_audio_count > 0 and audio_parts is not None:
+                suffix_audio_parts = audio_parts[int(prefix_audio_count):]
+            else:
+                suffix_audio_parts = None
+
+        first_token = decode_one_token(
+            model=model,
+            x=prompt_suffix,
+            input_pos=input_pos,
+            temperature=temperature_t,
+            top_p=top_p_t,
+            top_k=top_k,
+            semantic_logit_bias=semantic_logit_bias,
+            audio_masks=suffix_audio_masks,
+            audio_parts=suffix_audio_parts,
+            previous_tokens=previous_tokens,
+        )
+        dt_prefill = (time.perf_counter() - t_prefill) * 1000
+        logger.info(
+            f"[KV Cache] Partial prefill: {T - suffix_start} tokens "
+            f"(skipped {suffix_start}) in {dt_prefill:.0f}ms"
+        )
+    else:
+        # Full prefill (no cache or cache unusable)
+        t_prefill = time.perf_counter()
+        input_pos = torch.arange(0, T, device=device, dtype=torch.long)
+        prompt_3d = prompt[None].repeat(1, 1, 1)
+
+        first_token = decode_one_token(
+            model=model,
+            x=prompt_3d,
+            input_pos=input_pos,
+            temperature=temperature_t,
+            top_p=top_p_t,
+            top_k=top_k,
+            semantic_logit_bias=semantic_logit_bias,
+            audio_masks=audio_masks,
+            audio_parts=audio_parts,
+            previous_tokens=previous_tokens,
+        )
+        dt_prefill = (time.perf_counter() - t_prefill) * 1000
+        logger.info(f"Full prefill: {T} tokens in {dt_prefill:.0f}ms")
+
+        # [OPT-KVC] Save KV cache for prefix after full prefill
+        if should_save_cache and prefix_len > 0:
+            try:
+                save_kv_cache(ref_id, model, prefix_len, cache_key)
+            except Exception as e:
+                logger.warning(f"Failed to save KV cache: {e}")
 
     previous_tokens[:, ras_pos % RAS_WIN_SIZE] = first_token.view(
         codebook_dim, -1
