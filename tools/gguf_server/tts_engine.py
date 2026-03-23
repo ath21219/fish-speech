@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from loguru import logger
 
 from .codec_manager import codec_on_gpu
@@ -558,86 +559,87 @@ def _generate_streaming(
             graph_runner = None
 
     # ── Decode loop ──
-    while not finished and total_tokens < effective_max:
-        if graph_runner is not None and graph_runner.captured:
-            next_token = graph_runner.replay(
-                x=fixed_cur_token,
-                input_pos=fixed_input_pos,
-                temperature=temperature_t,
-                top_p=top_p_t,
-                previous_tokens=previous_tokens,
-            )
-        else:
-            next_token = decode_one_token(
-                model=model,
-                x=fixed_cur_token,
-                input_pos=fixed_input_pos,
-                temperature=temperature_t,
-                top_p=top_p_t,
-                top_k=top_k,
-                semantic_logit_bias=semantic_logit_bias,
-                audio_masks=audio_masks,
-                audio_parts=audio_parts,
-                previous_tokens=previous_tokens,
-            )
+    with sdpa_kernel(SDPBackend.MATH):
+        while not finished and total_tokens < effective_max:
+            if graph_runner is not None and graph_runner.captured:
+                next_token = graph_runner.replay(
+                    x=fixed_cur_token,
+                    input_pos=fixed_input_pos,
+                    temperature=temperature_t,
+                    top_p=top_p_t,
+                    previous_tokens=previous_tokens,
+                )
+            else:
+                next_token = decode_one_token(
+                    model=model,
+                    x=fixed_cur_token,
+                    input_pos=fixed_input_pos,
+                    temperature=temperature_t,
+                    top_p=top_p_t,
+                    top_k=top_k,
+                    semantic_logit_bias=semantic_logit_bias,
+                    audio_masks=audio_masks,
+                    audio_parts=audio_parts,
+                    previous_tokens=previous_tokens,
+                )
 
-        fixed_input_pos.add_(1)
-        fixed_cur_token.copy_(next_token.view(1, codebook_dim, 1))
+            fixed_input_pos.add_(1)
+            fixed_cur_token.copy_(next_token.view(1, codebook_dim, 1))
 
-        previous_tokens[:, ras_pos % RAS_WIN_SIZE] = next_token.view(
-            codebook_dim, -1
-        )[:, 0]
-        ras_pos += 1
-        total_tokens += 1
+            previous_tokens[:, ras_pos % RAS_WIN_SIZE] = next_token.view(
+                codebook_dim, -1
+            )[:, 0]
+            ras_pos += 1
+            total_tokens += 1
 
-        all_new_tokens.append(next_token)
-        pending_tokens.append(next_token)
-        tokens_since_last_chunk += 1
+            all_new_tokens.append(next_token)
+            pending_tokens.append(next_token)
+            tokens_since_last_chunk += 1
 
-        # [OPT-F19] Batched im_end check
-        semantic_id_buffer[buf_pos] = next_token[0, 0]
-        buf_pos += 1
+            # [OPT-F19] Batched im_end check
+            semantic_id_buffer[buf_pos] = next_token[0, 0]
+            buf_pos += 1
 
-        if buf_pos >= CHECK_INTERVAL:
-            if (semantic_id_buffer[:buf_pos] == im_end_tensor).any().item():
-                match_mask = semantic_id_buffer[:buf_pos] == im_end_tensor
-                first_match = match_mask.nonzero(as_tuple=False)[0, 0].item()
-                tokens_to_discard = buf_pos - first_match - 1
-                if tokens_to_discard > 0:
-                    all_new_tokens = all_new_tokens[:-tokens_to_discard]
-                    pending_tokens = pending_tokens[:-tokens_to_discard]
-                    tokens_since_last_chunk -= tokens_to_discard
-                    total_tokens -= tokens_to_discard
-                finished = True
-            buf_pos = 0
+            if buf_pos >= CHECK_INTERVAL:
+                if (semantic_id_buffer[:buf_pos] == im_end_tensor).any().item():
+                    match_mask = semantic_id_buffer[:buf_pos] == im_end_tensor
+                    first_match = match_mask.nonzero(as_tuple=False)[0, 0].item()
+                    tokens_to_discard = buf_pos - first_match - 1
+                    if tokens_to_discard > 0:
+                        all_new_tokens = all_new_tokens[:-tokens_to_discard]
+                        pending_tokens = pending_tokens[:-tokens_to_discard]
+                        tokens_since_last_chunk -= tokens_to_discard
+                        total_tokens -= tokens_to_discard
+                    finished = True
+                buf_pos = 0
 
-        # ── Emit chunk ──
-        threshold = min_first_chunk if is_first_chunk else chunk_size
-        should_emit = (
-            streaming and tokens_since_last_chunk >= threshold
-        ) or finished
+            # ── Emit chunk ──
+            threshold = min_first_chunk if is_first_chunk else chunk_size
+            should_emit = (
+                streaming and tokens_since_last_chunk >= threshold
+            ) or finished
 
-        if should_emit and pending_tokens:
-            chunk_all = torch.cat(pending_tokens, dim=1)
-            codes_new = chunk_all[1:, :].clone().clamp(min=0)
+            if should_emit and pending_tokens:
+                chunk_all = torch.cat(pending_tokens, dim=1)
+                codes_new = chunk_all[1:, :].clone().clamp(min=0)
 
-            if codes_new.shape[1] > 0:
-                t_dec = time.perf_counter()
-                audio_np = streaming_decoder.decode_chunk(codes_new)
-                t_dec_ms = (time.perf_counter() - t_dec) * 1000
+                if codes_new.shape[1] > 0:
+                    t_dec = time.perf_counter()
+                    audio_np = streaming_decoder.decode_chunk(codes_new)
+                    t_dec_ms = (time.perf_counter() - t_dec) * 1000
 
-                if len(audio_np) > 0:
-                    chunk_duration = len(audio_np) / state.sample_rate
-                    logger.debug(
-                        f"Streaming decode: {codes_new.shape[1]} frames → "
-                        f"{chunk_duration:.2f}s audio in {t_dec_ms:.0f}ms"
-                    )
-                    yield {"type": "codes", "codes": codes_new.cpu()}
-                    yield {"type": "audio_chunk", "audio": audio_np}
+                    if len(audio_np) > 0:
+                        chunk_duration = len(audio_np) / state.sample_rate
+                        logger.debug(
+                            f"Streaming decode: {codes_new.shape[1]} frames → "
+                            f"{chunk_duration:.2f}s audio in {t_dec_ms:.0f}ms"
+                        )
+                        yield {"type": "codes", "codes": codes_new.cpu()}
+                        yield {"type": "audio_chunk", "audio": audio_np}
 
-            pending_tokens = []
-            tokens_since_last_chunk = 0
-            is_first_chunk = False
+                pending_tokens = []
+                tokens_since_last_chunk = 0
+                is_first_chunk = False
 
     # ── Post-loop buffer flush ──
     if not finished and buf_pos > 0:

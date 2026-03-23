@@ -1,4 +1,3 @@
-# fish_speech/gguf/patches.py
 """
 Runtime patches for fish-speech model compatibility.
 
@@ -14,22 +13,13 @@ from loguru import logger
 
 
 def patch_attention_sdpa():
-    """Patch Attention.forward for optimal SDPA backend selection.
+    """Remove flash-attention-only constraint from Attention.forward.
 
-    Benchmark results (RTX 2070, sm75, FP16, per-layer):
-      Decode  (seq=1, no mask, kv=2048):  0.103ms  (was 0.161ms, 1.6× faster)
-      Prefill (seq=816, no mask, causal):  0.246ms  (was 1.224ms, 5.0× faster)
-
-    By removing attn_mask, PyTorch selects EFFICIENT_ATTENTION (or
-    FLASH_ATTENTION where available) instead of falling back to MATH.
-
-    Two paths for KV-cached inference:
-      - Decode  (seqlen=1):  No mask, no slice, is_causal=False.
-        K/V includes zero-filled future slots, but softmax naturally
-        suppresses attention to zero vectors. CUDA Graph compatible.
-      - Prefill (seqlen>1): Slice K/V to valid range, is_causal=True.
-        Uses .item() so NOT captured in CUDA Graph, but prefill only
-        runs once per batch (not in the hot decode loop).
+    llama.py wraps the mask=None SDPA call in
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+    which fails when flash attention is not compiled (Windows builds,
+    some PyTorch versions). This patch removes that restriction and
+    lets PyTorch auto-select the best available backend.
 
     Safe to call multiple times (idempotent).
     """
@@ -66,40 +56,13 @@ def patch_attention_sdpa():
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
 
         if self.use_sdpa:
-            if self.kv_cache is not None and input_pos is not None:
-                # ── KV-cached inference ──
-                if seqlen == 1:
-                    # DECODE: Single query attends to all cached positions.
-                    # No mask, no slice — CUDA Graph compatible.
-                    # Uninitialized KV slots are zero; softmax naturally
-                    # gives them near-zero weight, so quality is preserved.
-                    # This enables EFFICIENT_ATTENTION backend (1.6× vs MATH).
-                    y = F.scaled_dot_product_attention(
-                        q, k, v,
-                        dropout_p=0.0,
-                        is_causal=False,
-                    )
-                else:
-                    # PREFILL: Slice K/V to valid range for is_causal=True.
-                    # .item() is fine here — prefill runs once before CUDA
-                    # Graph capture, never inside the captured graph.
-                    kv_len = input_pos[-1].item() + 1
-                    y = F.scaled_dot_product_attention(
-                        q,
-                        k[:, :, :kv_len, :],
-                        v[:, :, :kv_len, :],
-                        dropout_p=0.0,
-                        is_causal=True,
-                    )
-            elif mask is None:
-                # Training / no KV cache, full causal
+            if mask is None:
                 y = F.scaled_dot_product_attention(
                     q, k, v,
                     dropout_p=self.dropout if self.training else 0.0,
                     is_causal=True,
                 )
             else:
-                # Explicit mask provided (training with padding etc.)
                 y = F.scaled_dot_product_attention(
                     q, k, v,
                     attn_mask=mask,
@@ -117,4 +80,4 @@ def patch_attention_sdpa():
 
     Attention.forward = _patched_forward
     Attention._gguf_sdpa_patched = True
-    logger.debug("  Patched Attention.forward (mask-free SDPA for EFFICIENT/FLASH backend)")
+    logger.debug("  Patched Attention.forward (removed flash-only SDPA constraint)")
