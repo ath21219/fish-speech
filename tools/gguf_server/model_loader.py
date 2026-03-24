@@ -10,7 +10,7 @@ import gguf
 from loguru import logger
 
 from .codec_manager import load_codec_from_gguf
-from .state import MODELS_DIR, state
+from .state import MODELS_DIR, save_server_state, state
 
 
 def load_models(args, name=None):
@@ -95,6 +95,7 @@ def load_models(args, name=None):
     state.max_seq_len = args.max_seq_len
     state.active_model_name = name
     state.ready = True
+    save_server_state()
 
     # Try to keep codec on GPU alongside model
     _try_codec_gpu_resident(codec, args.device)

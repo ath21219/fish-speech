@@ -1,10 +1,10 @@
 """
 Fish Speech GGUF API Server
-Triton-accelerated Q6_K inference with OpenAI-compatible TTS endpoint.
+CUDA-accelerated GGUF inference with OpenAI-compatible TTS endpoint.
 
 Usage:
   python tools/api_server_gguf.py \
-    --model-name s2-pro-q6_k \
+    --model-name s2-pro-q3_k_s \
     --listen 0.0.0.0:7820
 """
 
@@ -38,8 +38,8 @@ def parse_args():
     parser.add_argument(
         "--model-name",
         type=str,
-        default="s2-pro-q6_k",
-        help="Model to load on startup",
+        default=None,
+        help="Model to load on startup (omit to restore previous state)",
     )
     parser.add_argument(
         "--codec-path",
@@ -105,19 +105,31 @@ if __name__ == "__main__":
     codec_source = "External" if args.codec_path else "Embedded"
     print_startup_banner(args, codec_source)
 
+    from loguru import logger
+
     # ── Store args globally for dynamic model loading ──
     import gguf_server.state as _state_mod
 
     _state_mod._server_args = args
 
+    # ── Resolve model name: CLI arg > saved state > none ──
+    from gguf_server.state import load_server_state
+
+    model_to_load = args.model_name
+    if model_to_load is None:
+        saved = load_server_state()
+        if saved:
+            logger.info(f"Restoring previous model state: {saved}")
+            model_to_load = saved
+        else:
+            logger.info("No saved state found — starting without model")
+
     # ── Load models ──
-    if args.model_name:
-        load_models(args, name=args.model_name)
+    if model_to_load:
+        load_models(args, name=model_to_load)
 
     # ── Start server ──
     host, port = args.listen.rsplit(":", 1)
-    from loguru import logger
-
     logger.info(f"Starting server on {args.listen}")
 
     uvicorn.run(

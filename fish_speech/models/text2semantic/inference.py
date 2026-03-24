@@ -184,11 +184,7 @@ class CUDAGraphRunner:
                     float("-inf"), device=device, dtype=torch.float16
                 )
                 neg_inf_count += 1
-        logger.info(
-            "[CUDA Graph] Phase 0c: Set _neg_inf on %d Attention modules (device=%s)",
-            neg_inf_count,
-            device,
-        )
+        logger.info(f"[CUDA Graph] Phase 0c: Set _neg_inf on {neg_inf_count} Attention modules (device={device})")
 
         # ── Phase 1: Warmup on side stream ──
         logger.info("[CUDA Graph] Warming up decode function...")

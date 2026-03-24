@@ -10,11 +10,14 @@ services:
       - "7820:7820"
 
     volumes:
-      - ./models:/app/models:rw
+      - ./models:/app/models:rw          # includes .server_state.json for auto-restore
       - ./references:/app/references:rw
 
     environment:
-      - MODEL_NAME=s2-pro-q6_k
+      # MODEL_NAME is optional. If omitted, the server restores the last
+      # loaded model from models/.server_state.json automatically.
+      # Set explicitly to override: MODEL_NAME=s2-pro-q3_k_s
+      - MODEL_NAME=${MODEL_NAME:-}
       # Codec is loaded from GGUF by default. Set CODEC_PATH to use external codec.pth
       # - CODEC_PATH=/app/checkpoints/s2-pro/codec.pth
       - API_HOST=0.0.0.0

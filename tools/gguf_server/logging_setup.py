@@ -94,7 +94,7 @@ def print_startup_banner(args, codec_source: str = "Embedded"):
     logger.info("=" * 50)
     logger.info("Fish Speech GGUF API Server")
     logger.info("=" * 50)
-    logger.info(f"  Model:       {args.model_name or '(none)'}")
+    logger.info(f"  Model:       {args.model_name or '(auto-restore)'}")
     logger.info(f"  Codec:       {codec_source}")
     logger.info(f"  Listen:      {args.listen}")
     logger.info(f"  Max seq len: {args.max_seq_len}")

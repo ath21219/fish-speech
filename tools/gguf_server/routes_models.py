@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 from .model_loader import load_models
-from .state import MODELS_DIR, state
+from .state import MODELS_DIR, save_server_state, state
 
 router = APIRouter()
 
@@ -152,6 +152,7 @@ async def unload_model_endpoint(name: str):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    save_server_state()
     return {"message": f"Model '{name}' unloaded successfully"}
 
 
