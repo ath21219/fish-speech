@@ -306,11 +306,11 @@ def _warmup_full_pipeline(model, device, dtype):
 
 def _warmup_cuda_kernels(model):
     """Pre-run CUDA GEMV kernels for each unique (D_out, D_in, qtype) shape.
-    
+
     This warms up:
       1. The JIT-compiled CUDA extension (already compiled at import time)
-      2. The internal buffer pool (first call allocates Q8_1 buffers)
-      3. CUDA driver caches for kernel launches
+      2. The persistent Q8_1 buffer pool (first call grows to max D_in)
+      3. CUDA driver caches for multi-warp kernel launches (4 warps/row)
     """
     from fish_speech.gguf.dequant import GGUFLinear
     from fish_speech.gguf.cuda_kernels import (

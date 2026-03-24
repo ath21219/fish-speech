@@ -1,14 +1,15 @@
 /*
- * GGUF Fused Dequant + GEMV CUDA Kernels for fish-speech (v3: dp4a)
+ * GGUF Fused Dequant + GEMV CUDA Kernels for fish-speech (v4: multi-warp dp4a)
  *
- * Faithfully reproduces llama.cpp's mmvq algorithm:
+ * Faithfully reproduces llama.cpp's mmvq algorithm with multi-warp optimization:
  *   1. Input vector quantized to Q8_1 (int8 + scale)
- *   2. GEMV via dp4a (INT8 dot-product-accumulate instruction)
+ *   2. GEMV via dp4a with 4 warps per output row (shared-memory reduction)
  *
- * Key advantages over float-based v2:
- *   - dp4a: 4 INT8 multiply-adds in 1 instruction (vs 4 FP32 muls)
- *   - Q8_1 input: 1.125 bytes/value (vs 4 bytes for float32 = 3.6x less)
- *   - Matches llama.cpp's proven data access patterns
+ * Key improvements over v3 (single-warp):
+ *   - 4 warps per row: each warp processes nblocks/4 Q-blocks → ~3x fewer
+ *     inner-loop iterations per warp for typical D_in (2560–10240)
+ *   - __launch_bounds__(128, 1): compiler uses more registers, fewer spills
+ *   - Matches llama.cpp GENERIC (NVIDIA) configuration exactly
  *
  * Target: NVIDIA Turing SM75+ (RTX 2070)
  *
@@ -30,8 +31,8 @@
  *     qs[32]     offset 4   : int8 quantized values
  *
  * References:
- *   - llama.cpp ggml-cuda/mmvq.cu
- *   - llama.cpp ggml-cuda/vecdotq.cuh
+ *   - llama.cpp ggml-cuda/mmvq.cu  (mul_mat_vec_q kernel, calc_nwarps)
+ *   - llama.cpp ggml-cuda/vecdotq.cuh  (vec_dot_q6_K_q8_1_impl_mmvq)
  *   - llama.cpp ggml-cuda/quantize.cu
  */
 
@@ -49,8 +50,18 @@
 #define Q6K_BLOCK_SIZE  210
 #define Q3K_BLOCK_SIZE  110
 #define WARP_SIZE       32
-#define ROWS_PER_BLOCK  8
-#define GEMV_THREADS    (WARP_SIZE * ROWS_PER_BLOCK)  /* 256 */
+
+/*
+ * Multi-warp configuration (matching llama.cpp GENERIC for ncols_dst=1):
+ *   nwarps = 4  →  blockDim = (32, 4) = 128 threads
+ *   1 row per CUDA block (normal path)
+ *
+ * vs. v3: 8 warps, each on a separate row, no shared-memory reduction.
+ * The multi-warp approach reduces inner-loop iterations per warp by ~4x,
+ * improving per-row latency at the cost of a small shared-memory sync.
+ */
+#define NWARPS          4
+#define MW_THREADS      (WARP_SIZE * NWARPS)   /* 128 */
 
 /* ================================================================
  *  Q8_1 block structure (matches llama.cpp block_q8_1)
@@ -92,7 +103,7 @@ __device__ __forceinline__ int get_int_b4(const void* x, int i32) {
 
 
 /* ================================================================
- *  Q8_1 Quantization Kernel
+ *  Q8_1 Quantization Kernel  (unchanged from v3)
  *
  *  Each warp (32 threads) quantizes one block of 32 float values:
  *    1. Find max absolute value (warp reduce)
@@ -128,11 +139,20 @@ quantize_q8_1_kernel(
 
 
 /* ================================================================
- *  Q6_K GEMV with dp4a
+ *  Q6_K GEMV — Multi-Warp (4 warps per output row)
  *
- *  Reproduces llama.cpp vec_dot_q6_K_q8_1_impl_mmvq exactly.
+ *  Matching llama.cpp GENERIC: nwarps=4, blockDim=(32,4)=128 threads.
  *
- *  Thread mapping (32 lanes per warp, 1 warp per row):
+ *  Each warp processes blocks with stride NWARPS:
+ *    warp 0 → blocks 0, 4, 8, ...
+ *    warp 1 → blocks 1, 5, 9, ...
+ *    warp 2 → blocks 2, 6, 10, ...
+ *    warp 3 → blocks 3, 7, 11, ...
+ *
+ *  After the loop, partial sums from warps 1-3 are written to shared
+ *  memory.  Warp 0 accumulates everything and does warp_reduce_sum.
+ *
+ *  Thread mapping (32 lanes per warp, same as v3):
  *    Each lane reads 4 bytes from ql (get_int_b2) and qh,
  *    then performs 2 dp4a calls (QR6_K=2) per Q6_K block.
  *    32 lanes × 2 dp4a × 4 values/dp4a = 256 values/block. ✓
@@ -143,16 +163,16 @@ quantize_q8_1_kernel(
  *    vh_shift     = 2*((lane%16)/8)
  *    qh_index     = 8*(lane/16) + lane%8
  * ================================================================ */
-__global__ void __launch_bounds__(GEMV_THREADS)
+__global__ void __launch_bounds__(MW_THREADS, 1)
 gemv_q6k_q8_1_kernel(
     const block_q8_1* __restrict__ q8,
     const uint8_t*    __restrict__ qw,
     float*            __restrict__ y,
     int D_in, int D_out)
 {
-    const int warp_id = threadIdx.x / WARP_SIZE;
-    const int lane    = threadIdx.x & (WARP_SIZE - 1);
-    const int row     = blockIdx.x * ROWS_PER_BLOCK + warp_id;
+    const int lane = threadIdx.x;          /* 0..31 */
+    const int warp = threadIdx.y;          /* 0..NWARPS-1 */
+    const int row  = blockIdx.x;
 
     if (row >= D_out) return;
 
@@ -167,7 +187,7 @@ gemv_q6k_q8_1_kernel(
 
     float acc = 0.0f;
 
-    for (int b = 0; b < nblocks; b++) {
+    for (int b = warp; b < nblocks; b += NWARPS) {
         const uint8_t* bp = row_data + b * Q6K_BLOCK_SIZE;
         const block_q8_1* q8_b = q8 + b * 8; /* 8 Q8_1 blocks per Q6_K block */
 
@@ -201,20 +221,33 @@ gemv_q6k_q8_1_kernel(
         acc += d * sumf;
     }
 
+    /* ---- Inter-warp reduction via shared memory ---- */
+    __shared__ float smem[NWARPS - 1][WARP_SIZE];
+
+    if (warp > 0) {
+        smem[warp - 1][lane] = acc;
+    }
+    __syncthreads();
+    if (warp > 0) return;
+
+    /* Warp 0: accumulate partial sums from all warps */
+    #pragma unroll
+    for (int w = 0; w < NWARPS - 1; ++w) {
+        acc += smem[w][lane];
+    }
     acc = warp_reduce_sum(acc);
     if (lane == 0) y[row] = acc;
 }
 
 
 /* ================================================================
- *  Q3_K GEMV with dp4a
+ *  Q3_K GEMV — Multi-Warp (4 warps per output row)
  *
- *  Reproduces llama.cpp vec_dot_q3_K_q8_1_impl_mmvq exactly.
+ *  Matching llama.cpp GENERIC: nwarps=4, blockDim=(32,4)=128 threads.
  *
- *  Thread mapping: QI3_K=16, so 32 threads handle 2 blocks/iter.
- *    Threads 0-15 → block b, threads 16-31 → block b+1.
- *    Each thread does 4 dp4a calls (QR3_K=4) per block.
- *    16 threads × 4 dp4a × 4 values/dp4a = 256 values/block. ✓
+ *  Thread mapping: QI3_K=16, so each half-warp (16 threads) processes
+ *  one Q3_K block.  Within each warp, 2 half-warps handle 2 blocks.
+ *  With NWARPS=4, stride = 2*NWARPS = 8 blocks per iteration.
  *
  *  Index derivation (QI3_K=16, QR3_K=4, QI8_1=8):
  *    iqs          = lane % 16
@@ -222,23 +255,23 @@ gemv_q6k_q8_1_kernel(
  *    bq8_offset   = 4*(iqs/8)
  *    scale_base   = iqs - (iqs%8) + (iqs%8)/4
  * ================================================================ */
-__global__ void __launch_bounds__(GEMV_THREADS)
+__global__ void __launch_bounds__(MW_THREADS, 1)
 gemv_q3k_q8_1_kernel(
     const block_q8_1* __restrict__ q8,
     const uint8_t*    __restrict__ qw,
     float*            __restrict__ y,
     int D_in, int D_out)
 {
-    const int warp_id = threadIdx.x / WARP_SIZE;
-    const int lane    = threadIdx.x & (WARP_SIZE - 1);
-    const int row     = blockIdx.x * ROWS_PER_BLOCK + warp_id;
+    const int lane = threadIdx.x;          /* 0..31 */
+    const int warp = threadIdx.y;          /* 0..NWARPS-1 */
+    const int row  = blockIdx.x;
 
     if (row >= D_out) return;
 
     const int nblocks = D_in / QK_K;
     const uint8_t* row_data = qw + (size_t)row * nblocks * Q3K_BLOCK_SIZE;
 
-    /* Q3_K: qi=16, so 32 threads process 2 blocks per iteration */
+    /* Q3_K: 16 threads per block → 2 blocks per warp */
     const int iqs       = lane & 15;       /* 0..15 */
     const int block_ofs = lane >> 4;        /* 0 or 1 */
 
@@ -249,7 +282,10 @@ gemv_q3k_q8_1_kernel(
 
     float acc = 0.0f;
 
-    for (int b = block_ofs; b < nblocks; b += 2) {
+    /* 2 blocks per warp × NWARPS warps = 2*NWARPS blocks per iteration */
+    const int start_block = warp * 2 + block_ofs;
+
+    for (int b = start_block; b < nblocks; b += NWARPS * 2) {
         const uint8_t* bp = row_data + b * Q3K_BLOCK_SIZE;
         const block_q8_1* q8_b = q8 + b * 8; /* 8 Q8_1 blocks per Q3_K block */
 
@@ -294,6 +330,20 @@ gemv_q3k_q8_1_kernel(
         acc += d3 * sumf;
     }
 
+    /* ---- Inter-warp reduction via shared memory ---- */
+    __shared__ float smem[NWARPS - 1][WARP_SIZE];
+
+    if (warp > 0) {
+        smem[warp - 1][lane] = acc;
+    }
+    __syncthreads();
+    if (warp > 0) return;
+
+    /* Warp 0: accumulate partial sums from all warps */
+    #pragma unroll
+    for (int w = 0; w < NWARPS - 1; ++w) {
+        acc += smem[w][lane];
+    }
     acc = warp_reduce_sum(acc);
     if (lane == 0) y[row] = acc;
 }
@@ -318,8 +368,10 @@ void gemv_q6k_q8_1(
     const void* q8_input, const uint8_t* q_weight,
     float* output, int D_in, int D_out, cudaStream_t stream)
 {
-    const int grid = (D_out + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
-    gemv_q6k_q8_1_kernel<<<grid, GEMV_THREADS, 0, stream>>>(
+    /* 1 row per CUDA block, NWARPS warps per block */
+    const dim3 grid(D_out);
+    const dim3 block(WARP_SIZE, NWARPS);
+    gemv_q6k_q8_1_kernel<<<grid, block, 0, stream>>>(
         (const block_q8_1*)q8_input, q_weight, output, D_in, D_out);
 }
 
@@ -327,8 +379,9 @@ void gemv_q3k_q8_1(
     const void* q8_input, const uint8_t* q_weight,
     float* output, int D_in, int D_out, cudaStream_t stream)
 {
-    const int grid = (D_out + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
-    gemv_q3k_q8_1_kernel<<<grid, GEMV_THREADS, 0, stream>>>(
+    const dim3 grid(D_out);
+    const dim3 block(WARP_SIZE, NWARPS);
+    gemv_q3k_q8_1_kernel<<<grid, block, 0, stream>>>(
         (const block_q8_1*)q8_input, q_weight, output, D_in, D_out);
 }
 
