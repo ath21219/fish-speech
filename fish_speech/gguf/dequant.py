@@ -45,6 +45,24 @@ else:
     fused_dequant_gemv_q3k = None
     logger.debug("Triton not available, using PyTorch dequant for Q6_K")
 
+# ---------- CUDA kernels (optional, preferred over Triton on Windows) ----------
+try:
+    from fish_speech.gguf.cuda_kernels import (
+        _CUDA_KERNELS_AVAILABLE,
+        fused_gemv_q6k as _cuda_fused_gemv_q6k,
+        fused_gemv_q3k as _cuda_fused_gemv_q3k,
+    )
+    if _CUDA_KERNELS_AVAILABLE:
+        logger.info("CUDA Q6_K/Q3_K kernels loaded (dp4a fused GEMV)")
+    else:
+        _cuda_fused_gemv_q6k = None
+        _cuda_fused_gemv_q3k = None
+        logger.debug("CUDA kernels module found but kernels not available")
+except ImportError:
+    _CUDA_KERNELS_AVAILABLE = False
+    _cuda_fused_gemv_q6k = None
+    _cuda_fused_gemv_q3k = None
+    logger.debug("CUDA kernels module not found, will use Triton or fallback")
 
 # ================================================================
 #  torch custom op registration for torch.compile compatibility
@@ -348,43 +366,111 @@ class GGUFLinear(nn.Module):
                 f"shape={self.qparam.shape})"
             )
 
-
     def forward(self, x):
         if self._cache_enabled and self._cached_weight is not None and self._cache_dtype == x.dtype:
             w = self._cached_weight
             return F.linear(x, w, self.bias)
 
         # ---- Custom op path (for torch.compile) ----
-        if self._use_custom_op and _TRITON_AVAILABLE:
-            if (
-                self.qparam.qtype == gguf.GGMLQuantizationType.Q6_K
-                and self.qparam.data.is_cuda
-                and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1
-                and self.qparam.shape[1] % 256 == 0
-            ):
-                out = torch.ops.gguf.fused_gemv_q6k(
-                    x.view(-1), self.qparam.data,
-                    self.qparam.shape[1], self.qparam.shape[0],
-                )
-                out = out.view(1, 1, -1)
-                if self.bias is not None:
-                    out = out + self.bias
-                return out
-            
-            if (
-                self.qparam.qtype == gguf.GGMLQuantizationType.Q3_K
-                and self.qparam.data.is_cuda
-                and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1
-                and self.qparam.shape[1] % 256 == 0
-            ):
-                out = torch.ops.gguf.fused_gemv_q3k(
-                    x.view(-1), self.qparam.data,
-                    self.qparam.shape[1], self.qparam.shape[0],
-                )
-                out = out.view(1, 1, -1)
-                if self.bias is not None:
-                    out = out + self.bias
-                return out
+        if self._use_custom_op:
+            # Prefer CUDA kernels for custom_op if available
+            if _CUDA_KERNELS_AVAILABLE:
+                if (
+                    self.qparam.qtype == gguf.GGMLQuantizationType.Q6_K
+                    and self.qparam.data.is_cuda
+                    and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1
+                    and self.qparam.shape[1] % 256 == 0
+                ):
+                    out = _cuda_fused_gemv_q6k(
+                        x.view(-1).float(), self.qparam.data,
+                        self.qparam.shape[1], self.qparam.shape[0],
+                    )
+                    out = out.to(x.dtype).view(1, 1, -1)
+                    if self.bias is not None:
+                        out = out + self.bias
+                    return out
+
+                if (
+                    self.qparam.qtype == gguf.GGMLQuantizationType.Q3_K
+                    and self.qparam.data.is_cuda
+                    and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1
+                    and self.qparam.shape[1] % 256 == 0
+                ):
+                    out = _cuda_fused_gemv_q3k(
+                        x.view(-1).float(), self.qparam.data,
+                        self.qparam.shape[1], self.qparam.shape[0],
+                    )
+                    out = out.to(x.dtype).view(1, 1, -1)
+                    if self.bias is not None:
+                        out = out + self.bias
+                    return out
+
+            # Fall through to Triton custom_op if CUDA not available
+            if _TRITON_AVAILABLE:
+                if (
+                    self.qparam.qtype == gguf.GGMLQuantizationType.Q6_K
+                    and self.qparam.data.is_cuda
+                    and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1
+                    and self.qparam.shape[1] % 256 == 0
+                ):
+                    out = torch.ops.gguf.fused_gemv_q6k(
+                        x.view(-1), self.qparam.data,
+                        self.qparam.shape[1], self.qparam.shape[0],
+                    )
+                    out = out.view(1, 1, -1)
+                    if self.bias is not None:
+                        out = out + self.bias
+                    return out
+
+                if (
+                    self.qparam.qtype == gguf.GGMLQuantizationType.Q3_K
+                    and self.qparam.data.is_cuda
+                    and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1
+                    and self.qparam.shape[1] % 256 == 0
+                ):
+                    out = torch.ops.gguf.fused_gemv_q3k(
+                        x.view(-1), self.qparam.data,
+                        self.qparam.shape[1], self.qparam.shape[0],
+                    )
+                    out = out.view(1, 1, -1)
+                    if self.bias is not None:
+                        out = out + self.bias
+                    return out
+
+        # ---- CUDA kernel path (preferred, no torch.compile needed) ----
+        if (
+            _CUDA_KERNELS_AVAILABLE
+            and self.qparam.qtype == gguf.GGMLQuantizationType.Q6_K
+            and self.qparam.data.is_cuda
+            and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1
+            and self.qparam.shape[1] % 256 == 0
+        ):
+            self._log_path("cuda_fused_gemv_q6k")
+            out = _cuda_fused_gemv_q6k(
+                x.view(-1).float(), self.qparam.data,
+                self.qparam.shape[1], self.qparam.shape[0],
+            )
+            out = out.to(x.dtype).view(1, 1, -1)
+            if self.bias is not None:
+                out = out + self.bias
+            return out
+
+        if (
+            _CUDA_KERNELS_AVAILABLE
+            and self.qparam.qtype == gguf.GGMLQuantizationType.Q3_K
+            and self.qparam.data.is_cuda
+            and x.shape[0] == 1 and x.dim() == 3 and x.shape[1] == 1
+            and self.qparam.shape[1] % 256 == 0
+        ):
+            self._log_path("cuda_fused_gemv_q3k")
+            out = _cuda_fused_gemv_q3k(
+                x.view(-1).float(), self.qparam.data,
+                self.qparam.shape[1], self.qparam.shape[0],
+            )
+            out = out.to(x.dtype).view(1, 1, -1)
+            if self.bias is not None:
+                out = out + self.bias
+            return out
 
         # ---- Direct Triton path (no torch.compile) ----
         if (

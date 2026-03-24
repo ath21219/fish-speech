@@ -9,3 +9,9 @@ from fish_speech.gguf.dequant import (
 )
 from fish_speech.gguf.loader import load_gguf_model, load_gguf_into_model
 from fish_speech.gguf.patches import patch_attention_sdpa
+
+# NEW: expose CUDA kernel availability
+try:
+    from fish_speech.gguf.cuda_kernels import _CUDA_KERNELS_AVAILABLE
+except ImportError:
+    _CUDA_KERNELS_AVAILABLE = False

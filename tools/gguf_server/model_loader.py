@@ -6,6 +6,7 @@ import gc
 import time
 
 import torch
+import gguf
 from loguru import logger
 
 from .codec_manager import load_codec_from_gguf
@@ -110,10 +111,24 @@ def load_models(args, name=None):
     # Pre-compile Triton kernels
     from fish_speech.gguf.dequant import warmup_triton_kernels
 
-    logger.info("Warming up Triton kernels...")
-    t0 = time.perf_counter()
-    warmup_triton_kernels(model, dtype=torch.float16)
-    logger.info(f"Triton warmup done in {time.perf_counter() - t0:.1f}s")
+    # ---- kernel warmup (CUDA kernels or Triton) ----
+    try:
+        from fish_speech.gguf.cuda_kernels import _CUDA_KERNELS_AVAILABLE
+    except ImportError:
+        _CUDA_KERNELS_AVAILABLE = False
+
+    if _CUDA_KERNELS_AVAILABLE:
+        logger.info("CUDA kernels available — warming up CUDA GEMV kernels...")
+        t0 = time.perf_counter()
+        _warmup_cuda_kernels(model)
+        logger.info(f"CUDA kernel warmup done in {time.perf_counter() - t0:.1f}s")
+    else:
+        # Fallback to Triton warmup
+        from fish_speech.gguf.dequant import warmup_triton_kernels
+        logger.info("Warming up Triton kernels...")
+        t0 = time.perf_counter()
+        warmup_triton_kernels(model, dtype=torch.float16)
+        logger.info(f"Triton warmup done in {time.perf_counter() - t0:.1f}s")
 
     if torch.cuda.is_available():
         vram = torch.cuda.memory_allocated() / 1e9
@@ -169,3 +184,44 @@ def _try_codec_gpu_resident(codec, device):
             f"{total_vram:.1f} GB VRAM)"
         )
         state.codec_gpu_resident = False
+
+def _warmup_cuda_kernels(model):
+    """Pre-run CUDA GEMV kernels for each unique (D_out, D_in, qtype) shape.
+    
+    This warms up:
+      1. The JIT-compiled CUDA extension (already compiled at import time)
+      2. The internal buffer pool (first call allocates Q8_1 buffers)
+      3. CUDA driver caches for kernel launches
+    """
+    from fish_speech.gguf.dequant import GGUFLinear
+    from fish_speech.gguf.cuda_kernels import (
+        fused_gemv_q6k,
+        fused_gemv_q3k,
+    )
+
+    seen = set()
+    for module in model.modules():
+        if not isinstance(module, GGUFLinear):
+            continue
+        qp = module.qparam
+        if not qp.data.is_cuda:
+            continue
+        key = (qp.shape[0], qp.shape[1], qp.qtype.name)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        D_out, D_in = qp.shape
+        if D_in % 256 != 0:
+            continue
+
+        x_dummy = torch.randn(D_in, dtype=torch.float32, device=qp.data.device)
+
+        if qp.qtype == gguf.GGMLQuantizationType.Q6_K:
+            fused_gemv_q6k(x_dummy, qp.data, D_in, D_out)
+        elif qp.qtype == gguf.GGMLQuantizationType.Q3_K:
+            fused_gemv_q3k(x_dummy, qp.data, D_in, D_out)
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    logger.info(f"CUDA kernel warmup: {len(seen)} unique shapes")

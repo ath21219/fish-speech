@@ -104,6 +104,7 @@ site/
 ffmpeg.exe
 ffprobe.exe
 /faster_whisper/
+/llama.cpp/
 
 # Server Related
 # --------------
@@ -116,5 +117,5 @@ asr-label*
 
 # Models
 # ----------
-/models
-/checkpoints
+/models/
+/checkpoints/

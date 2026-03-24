@@ -34,3 +34,4 @@ datasets>=2.18.0
 lightning>=2.1.0
 loralib>=0.1.2
 descript-audio-codec>=0.4.0
+ninja>=1.13.0
