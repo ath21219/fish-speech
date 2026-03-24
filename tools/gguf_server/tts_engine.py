@@ -34,6 +34,68 @@ from fish_speech.gguf.kv_cache_store import (
 )
 
 
+# ── Decode cache: reusable objects across TTS requests ──
+# Invalidated on model load/unload.
+
+class _DecodeCache:
+    __slots__ = (
+        "model_id", "semantic_logit_bias", "im_end_id",
+        "graph_runner", "streaming_decoder",
+    )
+
+    def __init__(self):
+        self.model_id = None
+        self.semantic_logit_bias = None
+        self.im_end_id = None
+        self.graph_runner = None
+        self.streaming_decoder = None
+
+    def clear(self):
+        if self.graph_runner is not None:
+            try:
+                del self.graph_runner.graph
+            except Exception:
+                pass
+        self.model_id = None
+        self.semantic_logit_bias = None
+        self.im_end_id = None
+        self.graph_runner = None
+        self.streaming_decoder = None
+
+    def ensure_for_model(self, model, device, dtype):
+        """Lazily build model-dependent constants. No-op if already valid."""
+        mid = id(model)
+        if self.model_id == mid:
+            return
+        self.clear()
+        self.model_id = mid
+
+        from fish_speech.tokenizer import IM_END_TOKEN
+
+        vocab_size = model.config.vocab_size
+        bias = torch.full(
+            (1, 1, vocab_size), float("-inf"), device=device, dtype=dtype
+        )
+        bias[
+            0, 0,
+            model.config.semantic_begin_id : model.config.semantic_end_id + 1,
+        ] = 0.0
+        im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
+        bias[0, 0, im_end_id] = 0.0
+
+        self.semantic_logit_bias = bias
+        self.im_end_id = im_end_id
+
+
+_cache = _DecodeCache()
+
+
+def invalidate_decode_cache():
+    """Clear cached decode objects. Called on model load/unload."""
+    _cache.clear()
+    logger.info("Decode cache invalidated")
+
+
 def generate_speech_streaming(req: TTSRequest):
     """
     Generator that yields event dicts as semantic tokens are produced.
@@ -331,7 +393,6 @@ def _generate_streaming(
         CUDAGraphRunner,
         decode_one_token_ar,
     )
-    from fish_speech.tokenizer import IM_END_TOKEN
 
     device = prompt.device
     dtype = next(model.parameters()).dtype
@@ -357,30 +418,26 @@ def _generate_streaming(
             )
         model._cache_setup_done = True
 
-    # Build semantic logit bias
-    vocab_size = model.config.vocab_size
-    semantic_logit_bias = torch.full(
-        (1, 1, vocab_size), float("-inf"), device=device, dtype=dtype
-    )
-    semantic_logit_bias[
-        0,
-        0,
-        model.config.semantic_begin_id : model.config.semantic_end_id + 1,
-    ] = 0.0
-    im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
-    semantic_logit_bias[0, 0, im_end_id] = 0.0
+    # [OPT-CACHE] Reuse model-dependent constants across requests
+    _cache.ensure_for_model(model, device, dtype)
+    semantic_logit_bias = _cache.semantic_logit_bias
+    im_end_id = _cache.im_end_id
 
     temperature_t = torch.tensor(temperature, device=device, dtype=dtype)
     top_p_t = torch.tensor(top_p, device=device, dtype=dtype)
 
-    # Initialize streaming codec decoder
+    # [OPT-CACHE] Reuse streaming codec decoder (avoid KV cache re-setup)
     from fish_speech.models.dac.streaming_codec import StreamingCodecDecoder
 
-    streaming_decoder = StreamingCodecDecoder(
-        codec=codec,
-        device=str(next(codec.parameters()).device),
-        max_frames=effective_max + 64,
-    )
+    if _cache.streaming_decoder is None:
+        _cache.streaming_decoder = StreamingCodecDecoder(
+            codec=codec,
+            device=str(next(codec.parameters()).device),
+            max_frames=state.max_seq_len + 64,
+        )
+    else:
+        _cache.streaming_decoder.reset()
+    streaming_decoder = _cache.streaming_decoder
 
     # ── Zero KV caches to prevent stale data from prior generations ──
     for layer in model.layers:
@@ -522,7 +579,7 @@ def _generate_streaming(
     )
     buf_pos = 0
 
-    # [OPT-B6] CUDA Graph capture
+    # [OPT-B6+CACHE] CUDA Graph: reuse across requests
     use_cuda_graph = (
         device.type == "cuda"
         if isinstance(device, torch.device)
@@ -530,33 +587,44 @@ def _generate_streaming(
     )
     graph_runner = None
     if use_cuda_graph:
-        try:
-            graph_runner = CUDAGraphRunner(
-                model=model,
-                decode_fn=decode_one_token,
-                codebook_dim=codebook_dim,
-                device=(
-                    torch.device(device)
-                    if isinstance(device, str)
-                    else device
-                ),
-                dtype=dtype,
-                vocab_size=model.config.vocab_size,
-                top_k=top_k,
-                semantic_logit_bias=semantic_logit_bias,
-                audio_masks=audio_masks,
-                audio_parts=audio_parts,
-            )
+        if _cache.graph_runner is not None and _cache.graph_runner.captured:
+            # Reuse cached graph — just update static buffers
+            graph_runner = _cache.graph_runner
             graph_runner.static_x.copy_(fixed_cur_token)
             graph_runner.static_input_pos.copy_(fixed_input_pos)
             graph_runner.static_temperature.copy_(temperature_t)
             graph_runner.static_top_p.copy_(top_p_t)
-            graph_runner.warmup_and_capture()
-        except Exception as e:
-            logger.warning(
-                f"[CUDA Graph] Streaming capture failed ({e}), using eager"
-            )
-            graph_runner = None
+            logger.debug("[CUDA Graph] Reusing cached graph runner")
+        else:
+            try:
+                graph_runner = CUDAGraphRunner(
+                    model=model,
+                    decode_fn=decode_one_token,
+                    codebook_dim=codebook_dim,
+                    device=(
+                        torch.device(device)
+                        if isinstance(device, str)
+                        else device
+                    ),
+                    dtype=dtype,
+                    vocab_size=model.config.vocab_size,
+                    top_k=top_k,
+                    semantic_logit_bias=semantic_logit_bias,
+                    audio_masks=audio_masks,
+                    audio_parts=audio_parts,
+                )
+                graph_runner.static_x.copy_(fixed_cur_token)
+                graph_runner.static_input_pos.copy_(fixed_input_pos)
+                graph_runner.static_temperature.copy_(temperature_t)
+                graph_runner.static_top_p.copy_(top_p_t)
+                graph_runner.warmup_and_capture()
+                _cache.graph_runner = graph_runner
+                logger.info("[CUDA Graph] Captured and cached for reuse")
+            except Exception as e:
+                logger.warning(
+                    f"[CUDA Graph] Streaming capture failed ({e}), using eager"
+                )
+                graph_runner = None
 
     # ── Decode loop ──
     with sdpa_kernel(SDPBackend.MATH):
@@ -659,9 +727,7 @@ def _generate_streaming(
                     yield {"type": "codes", "codes": codes_new.cpu()}
                     yield {"type": "audio_chunk", "audio": audio_np}
 
-    if graph_runner is not None:
-        del graph_runner.graph
-        del graph_runner
+    # graph_runner is cached in _cache — do NOT delete
 
     # ── Stats ──
     t_total = time.perf_counter() - t0
@@ -672,6 +738,7 @@ def _generate_streaming(
         "tok_per_sec": total_tokens / t_total if t_total > 0 else 0,
     }
 
+    # streaming_decoder is cached — reset state but keep alive
     streaming_decoder.reset()
-    del streaming_decoder, fixed_cur_token, fixed_input_pos
+    del fixed_cur_token, fixed_input_pos
     del all_new_tokens, pending_tokens, semantic_id_buffer

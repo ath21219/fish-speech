@@ -11,6 +11,7 @@ from loguru import logger
 
 from .codec_manager import load_codec_from_gguf
 from .state import MODELS_DIR, save_server_state, state
+from .tts_engine import invalidate_decode_cache
 
 
 def load_models(args, name=None):
@@ -28,6 +29,7 @@ def load_models(args, name=None):
     # Unload existing
     if state.model is not None:
         logger.info("Unloading current model...")
+        invalidate_decode_cache()
         del state.model
         del state.codec
         state.model = None
@@ -131,6 +133,13 @@ def load_models(args, name=None):
         warmup_triton_kernels(model, dtype=torch.float16)
         logger.info(f"Triton warmup done in {time.perf_counter() - t0:.1f}s")
 
+    # ---- Full pipeline warmup: dummy prefill + CUDA Graph pre-capture ----
+    # This triggers all Triton JIT compilations (batch-mode dequant, etc.)
+    # and pre-captures the CUDA Graph, eliminating first-request latency.
+    t0 = time.perf_counter()
+    _warmup_full_pipeline(model, args.device, torch.float16)
+    logger.info(f"Full pipeline warmup done in {time.perf_counter() - t0:.1f}s")
+
     if torch.cuda.is_available():
         vram = torch.cuda.memory_allocated() / 1e9
         logger.info(f"Ready. VRAM: {vram:.2f} GB")
@@ -185,6 +194,115 @@ def _try_codec_gpu_resident(codec, device):
             f"{total_vram:.1f} GB VRAM)"
         )
         state.codec_gpu_resident = False
+
+def _warmup_full_pipeline(model, device, dtype):
+    """Run dummy prefill + CUDA Graph capture at startup.
+
+    This eliminates first-request latency by:
+      1. Triggering all Triton JIT compilations (batch-mode dequant, embedding, etc.)
+      2. Running CUDAGraphRunner.warmup_and_capture() which:
+         - Phase 0/0b: Materializes CPU tensors on GPU, caches GGUFEmbedding weights
+         - Phase 0c: Creates Attention._neg_inf on GPU
+         - Phase 1+2: Warms up and captures the CUDA Graph
+      3. Storing the captured graph in the decode cache for immediate reuse
+    """
+    from fish_speech.models.text2semantic.inference import (
+        CUDAGraphRunner,
+        decode_one_token_ar,
+    )
+    from fish_speech.tokenizer import IM_END_TOKEN
+    from .tts_engine import _cache
+
+    codebook_dim = 1 + model.config.num_codebooks
+    vocab_size = model.config.vocab_size
+
+    # Build semantic_logit_bias (same logic as _DecodeCache.ensure_for_model)
+    semantic_logit_bias = torch.full(
+        (1, 1, vocab_size), float("-inf"), device=device, dtype=dtype
+    )
+    semantic_logit_bias[
+        0, 0,
+        model.config.semantic_begin_id : model.config.semantic_end_id + 1,
+    ] = 0.0
+    im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
+    semantic_logit_bias[0, 0, im_end_id] = 0.0
+
+    # Dummy prefill — triggers Triton batch-mode JIT compilation
+    warmup_len = 32
+    dummy_tokens = torch.zeros(
+        (1, codebook_dim, warmup_len), dtype=torch.long, device=device
+    )
+    input_pos = torch.arange(warmup_len, device=device, dtype=torch.long)
+    temperature = torch.tensor(1.0, device=device, dtype=dtype)
+    top_p = torch.tensor(0.9, device=device, dtype=dtype)
+    previous_tokens = torch.zeros(
+        (codebook_dim, 10), dtype=torch.int, device=device
+    )
+
+    logger.info("Running dummy prefill for Triton JIT warmup...")
+    with torch.inference_mode():
+        first_token = decode_one_token_ar(
+            model=model,
+            x=dummy_tokens,
+            input_pos=input_pos,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=30,
+            semantic_logit_bias=semantic_logit_bias,
+            audio_masks=None,
+            audio_parts=None,
+            previous_tokens=previous_tokens,
+        )
+
+    # Pre-capture CUDA Graph
+    fixed_cur_token = first_token.view(1, codebook_dim, 1).clone()
+    fixed_input_pos = torch.tensor([warmup_len], device=device, dtype=torch.long)
+
+    try:
+        graph_runner = CUDAGraphRunner(
+            model=model,
+            decode_fn=decode_one_token_ar,
+            codebook_dim=codebook_dim,
+            device=torch.device(device),
+            dtype=dtype,
+            vocab_size=vocab_size,
+            top_k=30,
+            semantic_logit_bias=semantic_logit_bias,
+            audio_masks=None,
+            audio_parts=None,
+        )
+        graph_runner.static_x.copy_(fixed_cur_token)
+        graph_runner.static_input_pos.copy_(fixed_input_pos)
+        graph_runner.static_temperature.copy_(temperature)
+        graph_runner.static_top_p.copy_(top_p)
+        graph_runner.warmup_and_capture()
+
+        # Store in decode cache for immediate reuse by first TTS request
+        _cache.model_id = id(model)
+        _cache.semantic_logit_bias = semantic_logit_bias
+        _cache.im_end_id = im_end_id
+        _cache.graph_runner = graph_runner
+        logger.info("[Warmup] CUDA Graph pre-captured and cached")
+    except Exception as e:
+        logger.warning(f"[Warmup] CUDA Graph pre-capture failed: {e}")
+
+    # Zero KV caches — remove warmup artifacts
+    for layer in model.layers:
+        kv = layer.attention.kv_cache
+        if kv is not None:
+            kv.k_cache.zero_()
+            kv.v_cache.zero_()
+
+    # Also zero fast transformer caches if present
+    if hasattr(model, 'fast_layers'):
+        for layer in model.fast_layers:
+            if hasattr(layer, 'attention') and layer.attention.kv_cache is not None:
+                layer.attention.kv_cache.k_cache.zero_()
+                layer.attention.kv_cache.v_cache.zero_()
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
 
 def _warmup_cuda_kernels(model):
     """Pre-run CUDA GEMV kernels for each unique (D_out, D_in, qtype) shape.

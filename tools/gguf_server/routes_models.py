@@ -12,6 +12,7 @@ from loguru import logger
 
 from .model_loader import load_models
 from .state import MODELS_DIR, save_server_state, state
+from .tts_engine import invalidate_decode_cache
 
 router = APIRouter()
 
@@ -141,6 +142,7 @@ async def unload_model_endpoint(name: str):
         raise HTTPException(400, f"Model '{name}' is not currently loaded")
 
     logger.info("Unloading current model...")
+    invalidate_decode_cache()
     state.ready = False
     state.active_model_name = None
     if state.model is not None:
