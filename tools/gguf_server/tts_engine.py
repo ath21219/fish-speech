@@ -673,7 +673,8 @@ def _generate_streaming(
                 )
 
     # ── Prefill ──
-    RAS_WIN_SIZE = 10
+    from fish_speech.models.text2semantic.inference import RAS_WIN_SIZE
+
     previous_tokens = torch.zeros(
         (codebook_dim, RAS_WIN_SIZE), dtype=torch.int, device=device
     )

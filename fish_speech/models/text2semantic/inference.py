@@ -260,8 +260,8 @@ def multinomial_sample_one_no_sync(probs_sort):
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
 
-RAS_WIN_SIZE = 10  # window for Repetition Aware Sampling
-RAS_HIGH_TEMP = 1.0
+RAS_WIN_SIZE = 20  # window for Repetition Aware Sampling (広めに取り自然な繰り返しを許容)
+RAS_HIGH_TEMP = 0.8  # 発火時の温度を抑え声質の一貫性を維持
 RAS_HIGH_TOP_P = 0.9
 
 
@@ -270,11 +270,16 @@ def logits_to_probs(
     temperature: torch.Tensor,
     top_p: torch.Tensor,
     top_k: int,
-    neg_inf: torch.Tensor = None,  # ★ 追加: GPU上の -inf 定数
+    neg_inf: torch.Tensor = None,  # ★ GPU上の -inf 定数
 ) -> torch.Tensor:
     if neg_inf is None:
         # eager パスでのみ到達。CUDA Graph パスでは bufs['neg_inf'] が渡される
         neg_inf = logits.new_tensor(float("-inf"))
+
+    # ★ Temperature を top-p/top-k フィルタリングの前に適用
+    # これにより top-p の累積確率が temperature 適用後の分布に基づいて
+    # 正しく計算される（サンプリング品質の安定化）
+    logits = logits / torch.clip(temperature, min=1e-5)
 
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
     cum_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
@@ -282,16 +287,13 @@ def logits_to_probs(
     indices = torch.arange(sorted_logits.shape[-1], device=sorted_logits.device)
     top_k_mask = indices >= top_k
     sorted_indices_to_remove = (cum_probs > top_p) | top_k_mask
-    # ★ 修正: Python bool 代入 → テンソル演算
     first_mask = (indices == 0)
     sorted_indices_to_remove = sorted_indices_to_remove & ~first_mask
 
     indices_to_remove = sorted_indices_to_remove.scatter(
         dim=-1, index=sorted_indices, src=sorted_indices_to_remove
     )
-    # ★ 修正: float("-Inf") リテラル → GPU テンソル neg_inf
     logits = torch.where(indices_to_remove, neg_inf, logits)
-    logits = logits / torch.clip(temperature, min=1e-5)
 
     probs = torch.nn.functional.softmax(logits, dim=-1)
     return probs
