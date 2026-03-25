@@ -64,7 +64,8 @@ ENV MODEL_NAME= \
     API_HOST=0.0.0.0 \
     API_PORT=7820 \
     MAX_SEQ_LEN=2048 \
-    MAX_TEXT_LENGTH=0
+    MAX_TEXT_LENGTH=0 \
+    IDLE_OFFLOAD_TIMEOUT=0
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD curl -f http://localhost:${API_PORT}/v1/health || exit 1
@@ -113,6 +114,11 @@ RUN printf '%s\n' \
     '' \
     'if [ -n "${API_KEY:-}" ]; then' \
     '    CMD="${CMD} --api-key ${API_KEY}"' \
+    'fi' \
+    '' \
+    'IDLE_OFFLOAD_TIMEOUT="${IDLE_OFFLOAD_TIMEOUT:-0}"' \
+    'if [ "${IDLE_OFFLOAD_TIMEOUT}" -gt 0 ] 2>/dev/null; then' \
+    '    CMD="${CMD} --idle-offload-timeout ${IDLE_OFFLOAD_TIMEOUT}"' \
     'fi' \
     '' \
     'log "Executing: ${CMD}"' \

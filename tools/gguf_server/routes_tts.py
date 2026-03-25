@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response, StreamingResponse
 from loguru import logger
 
+from .idle_offload import ensure_on_gpu, touch_last_request
 from .schemas import AMPLITUDE, TTSRequest
 from .state import state
 from .tts_engine import generate_speech, generate_speech_streaming
@@ -38,6 +39,7 @@ async def tts(req: TTSRequest):
     else:
         with state.lock:
             try:
+                ensure_on_gpu()
                 t0 = time.perf_counter()
                 audio_np = generate_speech(req)
                 t_total = time.perf_counter() - t0
@@ -51,6 +53,8 @@ async def tts(req: TTSRequest):
             except Exception as e:
                 logger.opt(exception=True).error("Generation failed: {}", str(e))
                 raise HTTPException(status_code=500, detail="Generation failed")
+            finally:
+                touch_last_request()
 
         buffer = io.BytesIO()
         try:
@@ -88,10 +92,13 @@ async def _stream_tts(req: TTSRequest):
     def _worker():
         try:
             with state.lock:
+                ensure_on_gpu()
                 for event in generate_speech_streaming(req):
                     loop.call_soon_threadsafe(result_queue.put_nowait, event)
+            touch_last_request()
             loop.call_soon_threadsafe(result_queue.put_nowait, None)
         except Exception as e:
+            touch_last_request()
             loop.call_soon_threadsafe(
                 result_queue.put_nowait, {"type": "error", "error": str(e)}
             )

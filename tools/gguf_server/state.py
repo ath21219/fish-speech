@@ -25,6 +25,14 @@ class GGUFServerState:
         self.active_model_name = None
         self.codec_gpu_resident = False
 
+        # ── Idle VRAM offload state ──
+        self._offloaded = False
+        self._last_request_time = 0.0
+        self._idle_offload_timeout = 0       # seconds; 0 = disabled
+        self._offload_thread = None
+        self._offload_stop_event = None
+        self._codec_was_gpu_resident = False  # remember placement before offload
+
 
 # Singleton instances
 state = GGUFServerState()
@@ -43,8 +51,11 @@ _server_args = None
 
 
 def save_server_state():
-    """Persist current model load state to disk."""
-    data = {"active_model": state.active_model_name}
+    """Persist current model load state and settings to disk."""
+    data = {
+        "active_model": state.active_model_name,
+        "idle_offload_timeout": state._idle_offload_timeout,
+    }
     try:
         _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -54,12 +65,15 @@ def save_server_state():
         logger.warning(f"Failed to save server state to {_STATE_FILE}")
 
 
-def load_server_state() -> str | None:
-    """Load previously persisted model name. Returns None if unset or missing."""
+def load_server_state() -> dict | None:
+    """Load previously persisted server state.
+
+    Returns dict with keys 'active_model', 'idle_offload_timeout', etc.
+    Returns None if missing or unreadable.
+    """
     try:
         if _STATE_FILE.exists():
-            data = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
-            return data.get("active_model")
+            return json.loads(_STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
         pass
     return None

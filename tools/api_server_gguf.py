@@ -24,13 +24,20 @@ from gguf_server.model_loader import load_models
 from gguf_server.state import app
 
 # Import route modules so their routers get registered
-from gguf_server import routes_health, routes_models, routes_tts, routes_voices
+from gguf_server import (
+    routes_config,
+    routes_health,
+    routes_models,
+    routes_tts,
+    routes_voices,
+)
 
 # Register all routers
 app.include_router(routes_health.router)
 app.include_router(routes_tts.router)
 app.include_router(routes_voices.router)
 app.include_router(routes_models.router)
+app.include_router(routes_config.router)
 
 
 def parse_args():
@@ -89,6 +96,12 @@ def parse_args():
         action="store_true",
         help="Include timestamps in logs (for local dev)",
     )
+    parser.add_argument(
+        "--idle-offload-timeout",
+        type=int,
+        default=0,
+        help="Seconds of inactivity before offloading model to CPU (0 = disabled)",
+    )
     return parser.parse_args()
 
 
@@ -112,21 +125,35 @@ if __name__ == "__main__":
 
     _state_mod._server_args = args
 
-    # ── Resolve model name: CLI arg > saved state > none ──
+    # ── Restore saved state: CLI args take priority ──
     from gguf_server.state import load_server_state
 
+    saved = load_server_state()
+
     model_to_load = args.model_name
-    if model_to_load is None:
-        saved = load_server_state()
-        if saved:
-            logger.info(f"Restoring previous model state: {saved}")
-            model_to_load = saved
-        else:
-            logger.info("No saved state found — starting without model")
+    if model_to_load is None and saved:
+        model_to_load = saved.get("active_model")
+        if model_to_load:
+            logger.info(f"Restoring previous model: {model_to_load}")
+
+    if not model_to_load:
+        logger.info("No saved state found — starting without model")
 
     # ── Load models ──
     if model_to_load:
         load_models(args, name=model_to_load)
+
+    # ── Idle offload daemon: CLI arg > saved state > disabled ──
+    idle_timeout = args.idle_offload_timeout
+    if idle_timeout == 0 and saved:
+        idle_timeout = saved.get("idle_offload_timeout", 0)
+        if idle_timeout > 0:
+            logger.info(f"Restoring idle offload timeout: {idle_timeout}s")
+
+    if idle_timeout > 0:
+        from gguf_server.idle_offload import start_idle_offload_daemon
+
+        start_idle_offload_daemon(idle_timeout)
 
     # ── Start server ──
     host, port = args.listen.rsplit(":", 1)

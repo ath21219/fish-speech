@@ -25,6 +25,7 @@ services:
       - MAX_SEQ_LEN=2048
       - MAX_TEXT_LENGTH=${MAX_TEXT_LENGTH:-0}
       - API_KEY=${API_KEY:-}
+      - IDLE_OFFLOAD_TIMEOUT=${IDLE_OFFLOAD_TIMEOUT:-0}
       - NVIDIA_VISIBLE_DEVICES=all
 
     deploy:

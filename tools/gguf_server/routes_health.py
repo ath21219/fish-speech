@@ -23,6 +23,7 @@ async def health():
         model=state.active_model_name or "",
         device=state.device,
         vram_used_gb=round(vram, 2),
+        offloaded=state._offloaded,
     )
 
 

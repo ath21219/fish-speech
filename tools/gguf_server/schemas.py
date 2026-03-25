@@ -54,6 +54,7 @@ class TTSRequest(BaseModel):
     top_k: int = 30
     repetition_penalty: float = 1.2
     chunk_length: int = 200
+    sentence_split: bool = False
 
 
 class HealthResponse(BaseModel):
@@ -61,3 +62,4 @@ class HealthResponse(BaseModel):
     model: str = ""
     device: str = ""
     vram_used_gb: float = 0.0
+    offloaded: bool = False

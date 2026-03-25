@@ -27,6 +27,9 @@ from .schemas import (
 )
 from .state import state
 
+# ── Crossfade constant for sentence-split boundaries ──
+CROSSFADE_SAMPLES = 256  # ~6ms at 44.1kHz
+
 from fish_speech.gguf.kv_cache_store import (
     compute_cache_key,
     load_kv_cache,
@@ -94,6 +97,73 @@ def invalidate_decode_cache():
     """Clear cached decode objects. Called on model load/unload."""
     _cache.clear()
     logger.info("Decode cache invalidated")
+
+
+# ── Sentence splitting for long-text voice quality preservation ──
+
+_SENTENCE_SPLIT_RE = re.compile(
+    r"(?<=[。！？!?…\n])"        # Split after CJK/ASCII sentence-ending punctuation
+    r"|(?<=[.!?])\s+"            # Split after English punctuation + whitespace
+)
+
+
+def _split_into_sentences(text: str) -> list[str]:
+    """Split text at natural sentence boundaries.
+
+    Preserves speaker tags attached to the following sentence.
+    Merges very short fragments (<10 UTF-8 bytes) with the preceding sentence
+    to avoid generating degenerate single-word utterances.
+    """
+    raw_parts = _SENTENCE_SPLIT_RE.split(text)
+
+    sentences: list[str] = []
+    for part in raw_parts:
+        part = part.strip()
+        if not part:
+            continue
+        # Merge very short fragments with previous sentence
+        if sentences and len(part.encode("utf-8")) < 10:
+            sentences[-1] = sentences[-1] + part
+        else:
+            sentences.append(part)
+
+    return sentences if sentences else [text]
+
+
+def _crossfade_audio(
+    prev_tail: np.ndarray | None,
+    new_audio: np.ndarray,
+    n_crossfade: int = CROSSFADE_SAMPLES,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Apply linear crossfade between the tail of the previous sentence
+    and the head of the new sentence.
+
+    Returns (output_audio, new_tail_to_hold).
+    - output_audio: audio ready to yield (crossfaded head + middle, tail withheld)
+    - new_tail_to_hold: last n_crossfade samples to blend with next sentence
+    """
+    if len(new_audio) < n_crossfade * 2:
+        # Too short to crossfade — just concatenate
+        if prev_tail is not None:
+            combined = np.concatenate([prev_tail, new_audio])
+            return combined, None
+        return new_audio, None
+
+    if prev_tail is not None and len(prev_tail) == n_crossfade:
+        # Blend: prev_tail fades out, new_audio[:n_crossfade] fades in
+        fade_out = np.linspace(1.0, 0.0, n_crossfade, dtype=np.float32)
+        fade_in = np.linspace(0.0, 1.0, n_crossfade, dtype=np.float32)
+        blended = prev_tail * fade_out + new_audio[:n_crossfade] * fade_in
+        # Output: blended + body (minus tail to hold)
+        body = new_audio[n_crossfade:-n_crossfade]
+        tail = new_audio[-n_crossfade:]
+        output = np.concatenate([blended, body])
+        return output, tail
+    else:
+        # First sentence or no prev_tail — just hold the tail
+        output = new_audio[:-n_crossfade]
+        tail = new_audio[-n_crossfade:]
+        return output, tail
 
 
 def generate_speech_streaming(req: TTSRequest):
@@ -231,101 +301,222 @@ def generate_speech_streaming(req: TTSRequest):
         else [req.text]
     )
 
-    conversation = deepcopy(base_conversation)
     total_audio_samples = 0
     chunk_count = 0
 
-    for batch_idx, batch_text in enumerate(batches):
-        logger.info(f"Batch {batch_idx}: {len(batch_text.encode('utf-8'))} bytes")
+    # ── Sentence-split mode: each sentence gets a fresh context ──
+    if req.sentence_split:
+        crossfade_tail: np.ndarray | None = None  # held tail for crossfade
+        sentence_idx = 0
 
-        conversation.append(
-            Message(
-                role="user",
-                parts=[TextPart(text=batch_text, cal_loss=False)],
-                cal_loss=False,
-                add_im_start=True,
-                add_im_end=True,
-            )
-        )
-
-        conversation_gen = deepcopy(conversation)
-        conversation_gen.append(
-            Message(
-                role="assistant",
-                parts=[],
-                cal_loss=False,
-                modality="voice",
-                add_im_start=True,
-                add_im_end=False,
-            )
-        )
-
-        num_codebooks = model.config.num_codebooks
-        encoded, audio_masks, audio_parts = (
-            conversation_gen.encode_for_inference(
-                tokenizer, num_codebooks=num_codebooks
-            )
-        )
-        encoded = encoded.to(device=device)
-        prompt_len = encoded.shape[1]
-
-        if prompt_len > state.max_seq_len - 128:
-            raise ValueError(f"Prompt too long: {prompt_len} tokens")
-
-        t0 = time.perf_counter()
-        all_batch_codes = []
-
-        with torch.inference_mode():
-            y = _generate_streaming(
-                model=model,
-                prompt=encoded,
-                max_new_tokens=req.max_new_tokens,
-                audio_masks=audio_masks,
-                audio_parts=audio_parts,
-                decode_one_token=decode_one_token_ar,
-                temperature=req.temperature,
-                top_p=req.top_p,
-                top_k=req.top_k,
-                codec=state.codec,
-                chunk_size=STREAM_CHUNK_TOKENS,
-                min_first_chunk=STREAM_MIN_FIRST_CHUNK,
-                streaming=req.streaming,
-                ref_id=ref_id,
-                prefix_len=prefix_len,
-                cache_key=cache_key,
+        for batch_idx, batch_text in enumerate(batches):
+            sentences = _split_into_sentences(batch_text)
+            logger.info(
+                f"Batch {batch_idx}: {len(batch_text.encode('utf-8'))} bytes "
+                f"→ {len(sentences)} sentence(s)"
             )
 
-            for event in y:
-                if event["type"] == "codes":
-                    all_batch_codes.append(event["codes"])
-                elif event["type"] == "audio_chunk":
-                    chunk_count += 1
-                    audio_np = event["audio"]
-                    total_audio_samples += len(audio_np)
-                    yield {
-                        "type": "audio",
-                        "data": audio_np,
-                        "chunk_idx": chunk_count,
-                    }
-                elif event["type"] == "stats":
-                    logger.info(
-                        f"Batch {batch_idx}: {event['tokens']} tokens in "
-                        f"{event['time']:.1f}s "
-                        f"({event['tok_per_sec']:.1f} tok/s)"
+            for sent_text in sentences:
+                logger.info(
+                    f"  Sentence {sentence_idx}: "
+                    f"{len(sent_text.encode('utf-8'))} bytes"
+                )
+
+                # Fresh conversation per sentence (reference always dominant)
+                sent_conv = deepcopy(base_conversation)
+                sent_conv.append(
+                    Message(
+                        role="user",
+                        parts=[TextPart(text=sent_text, cal_loss=False)],
+                        cal_loss=False,
+                        add_im_start=True,
+                        add_im_end=True,
+                    )
+                )
+                sent_conv.append(
+                    Message(
+                        role="assistant",
+                        parts=[],
+                        cal_loss=False,
+                        modality="voice",
+                        add_im_start=True,
+                        add_im_end=False,
+                    )
+                )
+
+                num_codebooks = model.config.num_codebooks
+                encoded, audio_masks, audio_parts = (
+                    sent_conv.encode_for_inference(
+                        tokenizer, num_codebooks=num_codebooks
+                    )
+                )
+                encoded = encoded.to(device=device)
+                prompt_len = encoded.shape[1]
+
+                if prompt_len > state.max_seq_len - 128:
+                    raise ValueError(
+                        f"Prompt too long: {prompt_len} tokens "
+                        f"(sentence: {sent_text[:50]}...)"
                     )
 
-        if all_batch_codes:
-            merged = torch.cat(all_batch_codes, dim=1)
+                # Collect all audio from this sentence for crossfade
+                sent_audio_chunks: list[np.ndarray] = []
+
+                with torch.inference_mode():
+                    y = _generate_streaming(
+                        model=model,
+                        prompt=encoded,
+                        max_new_tokens=req.max_new_tokens,
+                        audio_masks=audio_masks,
+                        audio_parts=audio_parts,
+                        decode_one_token=decode_one_token_ar,
+                        temperature=req.temperature,
+                        top_p=req.top_p,
+                        top_k=req.top_k,
+                        codec=state.codec,
+                        chunk_size=STREAM_CHUNK_TOKENS,
+                        min_first_chunk=STREAM_MIN_FIRST_CHUNK,
+                        streaming=req.streaming,
+                        ref_id=ref_id,
+                        prefix_len=prefix_len,
+                        cache_key=cache_key,
+                    )
+
+                    for event in y:
+                        if event["type"] == "audio_chunk":
+                            sent_audio_chunks.append(event["audio"])
+                        elif event["type"] == "stats":
+                            logger.info(
+                                f"  Sentence {sentence_idx}: "
+                                f"{event['tokens']} tokens in "
+                                f"{event['time']:.1f}s "
+                                f"({event['tok_per_sec']:.1f} tok/s)"
+                            )
+
+                # Apply crossfade and yield
+                if sent_audio_chunks:
+                    sent_audio = np.concatenate(sent_audio_chunks)
+                    output, crossfade_tail = _crossfade_audio(
+                        crossfade_tail, sent_audio
+                    )
+                    if len(output) > 0:
+                        chunk_count += 1
+                        total_audio_samples += len(output)
+                        yield {
+                            "type": "audio",
+                            "data": output,
+                            "chunk_idx": chunk_count,
+                        }
+
+                sentence_idx += 1
+
+        # Flush remaining crossfade tail
+        if crossfade_tail is not None and len(crossfade_tail) > 0:
+            chunk_count += 1
+            total_audio_samples += len(crossfade_tail)
+            yield {
+                "type": "audio",
+                "data": crossfade_tail,
+                "chunk_idx": chunk_count,
+            }
+
+    else:
+        # ── Legacy mode: accumulated conversation across batches ──
+        conversation = deepcopy(base_conversation)
+
+        for batch_idx, batch_text in enumerate(batches):
+            logger.info(
+                f"Batch {batch_idx}: {len(batch_text.encode('utf-8'))} bytes"
+            )
+
             conversation.append(
                 Message(
-                    role="assistant",
-                    parts=[VQPart(codes=merged.cpu(), cal_loss=False)],
+                    role="user",
+                    parts=[TextPart(text=batch_text, cal_loss=False)],
                     cal_loss=False,
-                    modality="voice",
                     add_im_start=True,
                     add_im_end=True,
                 )
             )
+
+            conversation_gen = deepcopy(conversation)
+            conversation_gen.append(
+                Message(
+                    role="assistant",
+                    parts=[],
+                    cal_loss=False,
+                    modality="voice",
+                    add_im_start=True,
+                    add_im_end=False,
+                )
+            )
+
+            num_codebooks = model.config.num_codebooks
+            encoded, audio_masks, audio_parts = (
+                conversation_gen.encode_for_inference(
+                    tokenizer, num_codebooks=num_codebooks
+                )
+            )
+            encoded = encoded.to(device=device)
+            prompt_len = encoded.shape[1]
+
+            if prompt_len > state.max_seq_len - 128:
+                raise ValueError(f"Prompt too long: {prompt_len} tokens")
+
+            t0 = time.perf_counter()
+            all_batch_codes = []
+
+            with torch.inference_mode():
+                y = _generate_streaming(
+                    model=model,
+                    prompt=encoded,
+                    max_new_tokens=req.max_new_tokens,
+                    audio_masks=audio_masks,
+                    audio_parts=audio_parts,
+                    decode_one_token=decode_one_token_ar,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    top_k=req.top_k,
+                    codec=state.codec,
+                    chunk_size=STREAM_CHUNK_TOKENS,
+                    min_first_chunk=STREAM_MIN_FIRST_CHUNK,
+                    streaming=req.streaming,
+                    ref_id=ref_id,
+                    prefix_len=prefix_len,
+                    cache_key=cache_key,
+                )
+
+                for event in y:
+                    if event["type"] == "codes":
+                        all_batch_codes.append(event["codes"])
+                    elif event["type"] == "audio_chunk":
+                        chunk_count += 1
+                        audio_np = event["audio"]
+                        total_audio_samples += len(audio_np)
+                        yield {
+                            "type": "audio",
+                            "data": audio_np,
+                            "chunk_idx": chunk_count,
+                        }
+                    elif event["type"] == "stats":
+                        logger.info(
+                            f"Batch {batch_idx}: {event['tokens']} tokens in "
+                            f"{event['time']:.1f}s "
+                            f"({event['tok_per_sec']:.1f} tok/s)"
+                        )
+
+            if all_batch_codes:
+                merged = torch.cat(all_batch_codes, dim=1)
+                conversation.append(
+                    Message(
+                        role="assistant",
+                        parts=[VQPart(codes=merged.cpu(), cal_loss=False)],
+                        cal_loss=False,
+                        modality="voice",
+                        add_im_start=True,
+                        add_im_end=True,
+                    )
+                )
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
