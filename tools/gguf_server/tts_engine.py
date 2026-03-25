@@ -304,6 +304,9 @@ def generate_speech_streaming(req: TTSRequest):
     total_audio_samples = 0
     chunk_count = 0
 
+    # ── Resolve sliding window size: request > server default > disabled ──
+    sw_size = req.sliding_window_size or state.sliding_window_size or 0
+
     # ── Sentence-split mode: each sentence gets a fresh context ──
     if req.sentence_split:
         crossfade_tail: np.ndarray | None = None  # held tail for crossfade
@@ -380,6 +383,7 @@ def generate_speech_streaming(req: TTSRequest):
                         ref_id=ref_id,
                         prefix_len=prefix_len,
                         cache_key=cache_key,
+                        sliding_window_size=sw_size,
                     )
 
                     for event in y:
@@ -484,6 +488,7 @@ def generate_speech_streaming(req: TTSRequest):
                     ref_id=ref_id,
                     prefix_len=prefix_len,
                     cache_key=cache_key,
+                    sliding_window_size=sw_size,
                 )
 
                 for event in y:
@@ -572,6 +577,7 @@ def _generate_streaming(
     ref_id="",
     prefix_len=0,
     cache_key="",
+    sliding_window_size=0,
 ):
     """
     Token-by-token generation with streaming codec decode.
@@ -817,6 +823,15 @@ def _generate_streaming(
                 )
                 graph_runner = None
 
+    # ── Sliding window: pin reference tokens, window generated tokens ──
+    _use_sliding_window = sliding_window_size > 0 and prefix_len > 0
+    if _use_sliding_window:
+        model.enable_sliding_window(prefix_len, sliding_window_size)
+        logger.info(
+            f"[Sliding Window] enabled: prefix={prefix_len}, "
+            f"window={sliding_window_size}"
+        )
+
     # ── Decode loop ──
     with sdpa_kernel(SDPBackend.MATH):
         while not finished and total_tokens < effective_max:
@@ -929,7 +944,9 @@ def _generate_streaming(
         "tok_per_sec": total_tokens / t_total if t_total > 0 else 0,
     }
 
-    # streaming_decoder is cached — reset state but keep alive
+    # ── Cleanup ──
+    if _use_sliding_window:
+        model.disable_sliding_window()
     streaming_decoder.reset()
     del fixed_cur_token, fixed_input_pos
     del all_new_tokens, pending_tokens, semantic_id_buffer

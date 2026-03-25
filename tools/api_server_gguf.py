@@ -102,6 +102,12 @@ def parse_args():
         default=0,
         help="Seconds of inactivity before offloading model to CPU (0 = disabled)",
     )
+    parser.add_argument(
+        "--sliding-window-size",
+        type=int,
+        default=0,
+        help="Default sliding window size for attention (0=disabled, recommended: 512)",
+    )
     return parser.parse_args()
 
 
@@ -124,6 +130,7 @@ if __name__ == "__main__":
     import gguf_server.state as _state_mod
 
     _state_mod._server_args = args
+    _state_mod.state.sliding_window_size = args.sliding_window_size
 
     # ── Restore saved state: CLI args take priority ──
     from gguf_server.state import load_server_state

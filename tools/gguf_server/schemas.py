@@ -55,6 +55,7 @@ class TTSRequest(BaseModel):
     repetition_penalty: float = 1.2
     chunk_length: int = 200
     sentence_split: bool = False
+    sliding_window_size: int = 0  # 0=disabled, >0=window token count (recommended: 512)
 
 
 class HealthResponse(BaseModel):

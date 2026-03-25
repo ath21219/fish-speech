@@ -24,6 +24,29 @@ def find_multiple(n: int, k: int) -> int:
     return n + k - (n % k)
 
 
+def _build_windowed_causal_mask(
+    max_seq_len: int,
+    prefix_len: int,
+    window_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build causal mask with pinned reference tokens and sliding window.
+
+    Positions [0, prefix_len) are always visible (reference pinning).
+    Generated tokens only see the most recent window_size positions
+    plus all reference tokens.
+    """
+    rows = torch.arange(max_seq_len, device=device).unsqueeze(1)
+    cols = torch.arange(max_seq_len, device=device).unsqueeze(0)
+
+    causal = cols <= rows
+    is_reference = cols < prefix_len
+    window_start = (rows - window_size).clamp(min=prefix_len)
+    in_window = cols >= window_start
+
+    return causal & (is_reference | in_window)
+
+
 @dataclass
 class BaseModelArgs:
     model_type: str = "base"
@@ -322,6 +345,28 @@ class BaseTransformer(nn.Module):
                 self.config.head_dim,
                 dtype=dtype,
             )
+
+    def enable_sliding_window(self, prefix_len: int, window_size: int):
+        """Replace causal mask with windowed version for reference pinning.
+
+        Call before the decode loop. The original mask is saved internally
+        and restored by :meth:`disable_sliding_window`.
+        """
+        if not hasattr(self, "_original_causal_mask"):
+            self._original_causal_mask = self.causal_mask.clone()
+        mask = _build_windowed_causal_mask(
+            self.causal_mask.shape[0],
+            prefix_len,
+            window_size,
+            self.causal_mask.device,
+        )
+        self.causal_mask.copy_(mask)
+
+    def disable_sliding_window(self):
+        """Restore the standard causal mask."""
+        if hasattr(self, "_original_causal_mask"):
+            self.causal_mask.copy_(self._original_causal_mask)
+            del self._original_causal_mask
 
     def embed(self, inp: Tensor) -> Tensor:
         embeds = []

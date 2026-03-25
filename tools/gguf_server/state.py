@@ -24,6 +24,7 @@ class GGUFServerState:
         self.ready = False
         self.active_model_name = None
         self.codec_gpu_resident = False
+        self.sliding_window_size = 0  # server default; 0 = disabled
 
         # ── Idle VRAM offload state ──
         self._offloaded = False
