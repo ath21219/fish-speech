@@ -260,8 +260,8 @@ def multinomial_sample_one_no_sync(probs_sort):
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
 
-RAS_WIN_SIZE = 20  # window for Repetition Aware Sampling (広めに取り自然な繰り返しを許容)
-RAS_HIGH_TEMP = 0.8  # 発火時の温度を抑え声質の一貫性を維持
+RAS_WIN_SIZE = 10
+RAS_HIGH_TEMP = 1.0
 RAS_HIGH_TOP_P = 0.9
 
 
